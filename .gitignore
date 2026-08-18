@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# OS
+.DS_Store
+
+# Local scratch (never commit checkpoints, logs, or generated artifacts)
+generated-workflows/
+*.log
+
+# Env files with credentials (even local dev ones)
+.env
+.env.*
+!.env.example

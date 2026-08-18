@@ -1,0 +1,139 @@
+{
+  "version": 1,
+  "description": "Phase-1 ground-truth NL-request set for the baseline nl2workflow. Scoring rubric: 0.5*op-set Jaccard + 0.5*edge-set Jaccard (edges = op inputs + outputs.ref), exact flag for full structural match. The baseline generator is designed to reproduce these structures exactly; later phases measure the improvement curve on out-of-set requests.",
+  "requests": [
+    {
+      "id": "r-profile-a",
+      "request": "Give me Apple's company profile.",
+      "intent": "profile",
+      "symbols": ["AAPL"],
+      "workflow": {
+        "name": "nl2workflow-profile",
+        "inputs": {"Stock": []},
+        "ops": [
+          {"id": "Profile Query", "op": "DataRetrievalOp", "inputs": ["Stock"]}
+        ],
+        "outputs": [{"name": "profile", "ref": "Profile Query"}]
+      }
+    },
+    {
+      "id": "r-profile-b",
+      "request": "Show NVIDIA's company overview.",
+      "intent": "profile",
+      "symbols": ["NVDA"],
+      "workflow": {
+        "name": "nl2workflow-profile",
+        "inputs": {"Stock": []},
+        "ops": [
+          {"id": "Profile Query", "op": "DataRetrievalOp", "inputs": ["Stock"]}
+        ],
+        "outputs": [{"name": "profile", "ref": "Profile Query"}]
+      }
+    },
+    {
+      "id": "r-news",
+      "request": "What are the latest news headlines about NVDA?",
+      "intent": "news",
+      "symbols": ["NVDA"],
+      "workflow": {
+        "name": "nl2workflow-news",
+        "inputs": {"Stock": []},
+        "ops": [
+          {"id": "News Query", "op": "DataRetrievalOp", "inputs": ["Stock"]}
+        ],
+        "outputs": [{"name": "news", "ref": "News Query"}]
+      }
+    },
+    {
+      "id": "r-fundamentals",
+      "request": "How have Apple's revenue and earnings trended recently?",
+      "intent": "fundamentals",
+      "symbols": ["AAPL"],
+      "workflow": {
+        "name": "nl2workflow-fundamentals",
+        "inputs": {"Stock": []},
+        "ops": [
+          {"id": "Fundamentals Query", "op": "DataRetrievalOp", "inputs": ["Stock"]}
+        ],
+        "outputs": [{"name": "fundamentals", "ref": "Fundamentals Query"}]
+      }
+    },
+    {
+      "id": "r-market",
+      "request": "What are AAPL's recent market stats and 52-week range?",
+      "intent": "market",
+      "symbols": ["AAPL"],
+      "workflow": {
+        "name": "nl2workflow-market",
+        "inputs": {"Stock": []},
+        "ops": [
+          {"id": "Market Query", "op": "DataRetrievalOp", "inputs": ["Stock"]}
+        ],
+        "outputs": [{"name": "market", "ref": "Market Query"}]
+      }
+    },
+    {
+      "id": "r-trading-a",
+      "request": "Should I buy AAPL right now?",
+      "intent": "trading",
+      "symbols": ["AAPL"],
+      "workflow": {
+        "name": "nl2workflow-trading",
+        "inputs": {"Stock": []},
+        "ops": [
+          {"id": "SQL Date Planner", "op": "LLMChatOp", "inputs": ["Stock"]},
+          {"id": "Fundamentals Query", "op": "DataRetrievalOp", "inputs": ["Stock", "SQL Date Planner"]},
+          {"id": "Market Query", "op": "DataRetrievalOp", "inputs": ["Stock", "SQL Date Planner"]},
+          {"id": "News Query", "op": "DataRetrievalOp", "inputs": ["Stock"]},
+          {"id": "Bull Researcher", "op": "LLMChatOp", "inputs": ["Stock", "Fundamentals Query", "Market Query", "News Query"]},
+          {"id": "Bear Researcher", "op": "LLMChatOp", "inputs": ["Stock", "Fundamentals Query", "Market Query", "News Query"]},
+          {"id": "Bull Rebuttal", "op": "LLMChatOp", "inputs": ["Stock", "Bull Researcher", "Bear Researcher"]},
+          {"id": "Bear Rebuttal", "op": "LLMChatOp", "inputs": ["Stock", "Bull Researcher", "Bear Researcher"]},
+          {"id": "Risk Identifier", "op": "LLMChatOp", "inputs": ["Stock", "Bull Rebuttal", "Bear Rebuttal"]},
+          {"id": "Risk Synthesis", "op": "LLMChatOp", "inputs": ["Stock", "Bull Rebuttal", "Bear Rebuttal", "Risk Identifier"]},
+          {"id": "Fund Manager Verdict", "op": "LLMChatOp", "inputs": ["Stock", "Risk Synthesis"]}
+        ],
+        "outputs": [{"name": "final_recommendation", "ref": "Fund Manager Verdict"}]
+      }
+    },
+    {
+      "id": "r-trading-b",
+      "request": "Analyze NVDA as an investment and give me a recommendation.",
+      "intent": "trading",
+      "symbols": ["NVDA"],
+      "workflow": {
+        "name": "nl2workflow-trading",
+        "inputs": {"Stock": []},
+        "ops": [
+          {"id": "SQL Date Planner", "op": "LLMChatOp", "inputs": ["Stock"]},
+          {"id": "Fundamentals Query", "op": "DataRetrievalOp", "inputs": ["Stock", "SQL Date Planner"]},
+          {"id": "Market Query", "op": "DataRetrievalOp", "inputs": ["Stock", "SQL Date Planner"]},
+          {"id": "News Query", "op": "DataRetrievalOp", "inputs": ["Stock"]},
+          {"id": "Bull Researcher", "op": "LLMChatOp", "inputs": ["Stock", "Fundamentals Query", "Market Query", "News Query"]},
+          {"id": "Bear Researcher", "op": "LLMChatOp", "inputs": ["Stock", "Fundamentals Query", "Market Query", "News Query"]},
+          {"id": "Bull Rebuttal", "op": "LLMChatOp", "inputs": ["Stock", "Bull Researcher", "Bear Researcher"]},
+          {"id": "Bear Rebuttal", "op": "LLMChatOp", "inputs": ["Stock", "Bull Researcher", "Bear Researcher"]},
+          {"id": "Risk Identifier", "op": "LLMChatOp", "inputs": ["Stock", "Bull Rebuttal", "Bear Rebuttal"]},
+          {"id": "Risk Synthesis", "op": "LLMChatOp", "inputs": ["Stock", "Bull Rebuttal", "Bear Rebuttal", "Risk Identifier"]},
+          {"id": "Fund Manager Verdict", "op": "LLMChatOp", "inputs": ["Stock", "Risk Synthesis"]}
+        ],
+        "outputs": [{"name": "final_recommendation", "ref": "Fund Manager Verdict"}]
+      }
+    },
+    {
+      "id": "r-compare",
+      "request": "Compare AAPL and NVDA fundamentals.",
+      "intent": "compare",
+      "symbols": ["AAPL", "NVDA"],
+      "workflow": {
+        "name": "nl2workflow-compare",
+        "inputs": {"Stock": []},
+        "ops": [
+          {"id": "Fundamentals Query AAPL", "op": "DataRetrievalOp", "inputs": ["Stock"]},
+          {"id": "Fundamentals Query NVDA", "op": "DataRetrievalOp", "inputs": ["Stock"]}
+        ],
+        "outputs": [{"name": "comparison", "ref": "Fundamentals Query NVDA"}]
+      }
+    }
+  ]
+}

@@ -1,0 +1,588 @@
+From f103a4f6aa024dc434b14c963d9500733ea4db02 Mon Sep 17 00:00:00 2001
+From: ff98li <li.feifei.official@gmail.com>
+Date: Tue, 18 Aug 2026 20:57:14 +0800
+Subject: [PATCH] feat: add native worker provider for container-less hosts
+
+Adds a 'native' worker provider that spawns worker processes directly
+instead of Docker containers, a host nvidia-smi fallback for GPU
+enumeration, a FLOWMESH_COLLECT_GPU toggle so CPU workers report no GPU,
+and defensive provider-spec loading (docker.from_env raises eagerly on
+hosts without Docker).
+
+Signed-off-by: ff98li <li.feifei.official@gmail.com>
+---
+ src/server/supervisor/adapters/native.py  | 353 ++++++++++++++++++++++
+ src/server/supervisor/manager.py          |  22 +-
+ src/server/supervisor/resource_manager.py |  55 +++-
+ src/worker/hw.py                          |  68 +++--
+ 4 files changed, 449 insertions(+), 49 deletions(-)
+ create mode 100644 src/server/supervisor/adapters/native.py
+
+diff --git a/src/server/supervisor/adapters/native.py b/src/server/supervisor/adapters/native.py
+new file mode 100644
+index 0000000..09de950
+--- /dev/null
++++ b/src/server/supervisor/adapters/native.py
+@@ -0,0 +1,353 @@
++import asyncio
++import json
++import logging
++import os
++import signal
++import subprocess
++import sys
++import time
++from collections import Counter
++from enum import StrEnum
++from pathlib import Path
++from typing import Any
++
++from pydantic import BaseModel
++
++from ...hooks import PrincipalContext
++from ..resource_manager import GpuArch, ResourceManager
++from ..schemas import WorkerHardware, WorkerInfo, WorkerStatus
++from .base import (
++    ProviderSpec,
++    WorkerAdapter,
++    WorkerConfig,
++    WorkerFactory,
++    WorkerTokenType,
++)
++
++_STOP_TIMEOUT = 30  # seconds
++_PROVIDER_NAME = "native"
++_HW_PROBE_PREFIX = "HW_PROBE_OUTPUT: "
++_START_GRACE_SECONDS = 1.5
++
++logger = logging.getLogger("supervisor")
++
++
++class WorkerType(StrEnum):
++    CPU = "cpu"
++    GPU = "gpu"
++
++
++class NativeWorkerConfig(WorkerConfig):
++    worker_type: WorkerType = WorkerType.CPU
++    """Type of worker (cpu or gpu)"""
++    cuda_devices: list[int] | None = None
++    """List of CUDA devices to use (if any)"""
++    gpu_count: int = 1
++    """Number of GPUs to auto-pick when ``cuda_devices`` is unset
++    (only consulted for GPU workers)."""
++    command: list[str] | None = None
++    """Worker process command. Defaults to ``[sys.executable, -m, worker.main]``."""
++    cwd: str | None = None
++    """Working directory for the worker process (defaults to the
++    supervisor's working directory)."""
++    log_dir: str | None = None
++    """Directory for worker stdout/stderr logs (defaults to the heartbeat
++    file directory)."""
++
++    def model_post_init(self, __context: object) -> None:
++        super().model_post_init(__context)
++        if self.worker_type == WorkerType.GPU and (
++            isinstance(self.cuda_devices, list) and len(self.cuda_devices) == 0
++        ):
++            raise ValueError("Expected at least one CUDA device for GPU worker.")
++
++
++class NativeWorkerAdapter(WorkerAdapter):
++    """Runs a FlowMesh worker as a native OS process (no containers)."""
++
++    def __init__(
++        self,
++        token: WorkerTokenType,
++        name: str,
++        command: list[str],
++        cuda_devices: list[int] | None,
++        gpu_arch: GpuArch | None,
++        config: NativeWorkerConfig,
++        owner: PrincipalContext,
++    ) -> None:
++        if config.worker_type == WorkerType.GPU and (
++            cuda_devices is None or len(cuda_devices) == 0
++        ):
++            raise ValueError("Expected at least one CUDA device for GPU worker.")
++
++        super().__init__(token, name, config, owner)
++
++        self.config: NativeWorkerConfig
++        self.command = command
++        self.cuda_devices = cuda_devices
++        self.gpu_arch = gpu_arch
++
++        self._proc: subprocess.Popen[bytes] | None = None
++        self._status: WorkerStatus = WorkerStatus.STOPPED
++        self._hardware: WorkerHardware | dict[str, Any] | None = None
++
++    @property
++    def status(self) -> WorkerStatus:
++        return self._status
++
++    def set_status(self, status: WorkerStatus) -> None:
++        self._status = status
++
++    def get_info(self) -> WorkerInfo:
++        hardware = self._hardware
++        if isinstance(hardware, dict):
++            hardware = WorkerHardware.model_validate(hardware)
++            self._hardware = hardware
++        return WorkerInfo(
++            id=self.worker_id,
++            name=self.name,
++            provider=_PROVIDER_NAME,
++            status=self.status,
++            hardware=hardware,
++        )
++
++    async def start(self) -> bool:
++        self.set_status(WorkerStatus.STARTING)
++        try:
++            ok = await asyncio.to_thread(self._start)
++            if not ok:
++                self.set_status(WorkerStatus.STOPPED)
++            return ok
++        except Exception:
++            self.set_status(WorkerStatus.STOPPED)
++            raise
++
++    async def prepare(self) -> None:
++        self._hardware = await asyncio.to_thread(self._probe_hardware)
++
++    async def stop(self) -> bool:
++        prev_status = self.status
++        if prev_status in (WorkerStatus.STOPPING, WorkerStatus.STOPPED):
++            return True
++        self.set_status(WorkerStatus.STOPPING)
++        try:
++            ok = await asyncio.to_thread(self._stop)
++            if not ok:
++                self.set_status(prev_status)
++            return ok
++        except Exception:
++            self.set_status(prev_status)
++            raise
++
++    def _log_path(self) -> str:
++        log_dir = self.config.log_dir
++        if not log_dir:
++            hb_file = self.config.hb_file or os.path.join(
++                os.environ.get("WORKER_HB_DIR", "/tmp"), f"{self.token}.hb"
++            )
++            log_dir = os.path.dirname(hb_file) or "/tmp"
++        os.makedirs(log_dir, exist_ok=True)
++        return os.path.join(log_dir, f"{self.name}.log")
++
++    def _environment(self) -> dict[str, str]:
++        environment = self._base_environment()
++        # FlowMesh installs no packages (setuptools packages=[]); the worker
++        # process resolves `shared`/`worker` imports via PYTHONPATH=src.
++        src_dir = str(Path(__file__).resolve().parents[3])
++        existing = os.environ.get("PYTHONPATH", "")
++        environment["PYTHONPATH"] = f"{src_dir}{os.pathsep}{existing}".rstrip(
++            os.pathsep
++        )
++        if self.config.worker_type == WorkerType.GPU:
++            assert self.cuda_devices is not None
++            assert self.gpu_arch is not None
++            gpu_ids = ",".join(str(i) for i in self.cuda_devices)
++            environment["CUDA_VISIBLE_DEVICES"] = gpu_ids
++            environment["WORKER_HOST_GPU_ID"] = gpu_ids
++            environment["WORKER_HOST_GPU_ARCH"] = self.gpu_arch.value
++        else:
++            # Hide host GPUs from CPU workers so the scheduler cannot route
++            # GPU tasks onto them. NVML ignores CUDA_VISIBLE_DEVICES, so the
++            # hardware collector is disabled explicitly.
++            environment["CUDA_VISIBLE_DEVICES"] = ""
++            environment["FLOWMESH_COLLECT_GPU"] = "0"
++        return environment
++
++    def _start(self) -> bool:
++        if self._proc is not None and self._proc.poll() is None:
++            logger.warning("Worker process %s is already running.", self.name)
++            return True
++
++        cmd = self.command or [sys.executable, "-m", "worker.main"]
++        log_path = self._log_path()
++        log_file = open(log_path, "ab")
++        try:
++            proc = subprocess.Popen(
++                cmd,
++                cwd=self.config.cwd,
++                env={**os.environ, **self._environment()},
++                stdout=log_file,
++                stderr=subprocess.STDOUT,
++                start_new_session=True,
++            )
++        except Exception as exc:
++            log_file.close()
++            logger.error(
++                "Failed to start native worker %s: %s", self.name, repr(exc)
++            )
++            return False
++
++        self._proc = proc
++        time.sleep(_START_GRACE_SECONDS)
++        if proc.poll() is not None:
++            log_file.close()
++            logger.error(
++                "Native worker %s exited immediately (rc=%s); log: %s",
++                self.name,
++                proc.returncode,
++                log_path,
++            )
++            return False
++        log_file.close()
++
++        if self._hardware is None:
++            self._hardware = self._probe_hardware()
++        return True
++
++    def _stop(self) -> bool:
++        proc = self._proc
++        if proc is None or proc.poll() is not None:
++            self._proc = None
++            return True
++        try:
++            os.killpg(proc.pid, signal.SIGTERM)
++        except ProcessLookupError:
++            self._proc = None
++            return True
++        except Exception as exc:
++            logger.error("Failed to signal native worker %s: %s", self.name, repr(exc))
++            return False
++        try:
++            proc.wait(timeout=_STOP_TIMEOUT)
++        except subprocess.TimeoutExpired:
++            logger.warning(
++                "Native worker %s did not stop within %ss; killing it.",
++                self.name,
++                _STOP_TIMEOUT,
++            )
++            try:
++                os.killpg(proc.pid, signal.SIGKILL)
++            except Exception:
++                pass
++            proc.wait(timeout=10)
++        self._proc = None
++        return True
++
++    def _probe_hardware(self) -> dict[str, Any] | None:
++        cmd = [sys.executable, "-m", "worker.main", "--collect-hw"]
++        bandwidth = self.config.network_bandwidth
++        if bandwidth is not None:
++            cmd.extend(["--bandwidth-bytes-per-sec", str(bandwidth)])
++        cmd.extend(["--collect-hw-prefix", _HW_PROBE_PREFIX])
++        try:
++            result = subprocess.run(
++                cmd,
++                cwd=self.config.cwd,
++                env={**os.environ, **self._environment()},
++                capture_output=True,
++                timeout=120,
++            )
++        except Exception as exc:
++            logger.warning(
++                "Failed to run hardware probe for worker %s: %s",
++                self.name,
++                repr(exc),
++            )
++            return None
++        output = result.stdout or result.stderr or b""
++        return self._parse_hardware_output(output, _HW_PROBE_PREFIX)
++
++    @staticmethod
++    def _parse_hardware_output(
++        output: bytes | str | None, prefix: str | None
++    ) -> dict[str, Any] | None:
++        if output is None:
++            return None
++        if isinstance(output, (bytes, bytearray)):
++            output_text = output.decode("utf-8", errors="replace").strip()
++        else:
++            output_text = str(output).strip()
++        if not output_text:
++            logger.warning("Hardware probe returned no output")
++            return None
++        if prefix:
++            for line in output_text.splitlines():
++                if line.startswith(prefix):
++                    output_text = line.removeprefix(prefix)
++                    break
++        try:
++            payload = json.loads(output_text)
++        except json.JSONDecodeError as exc:
++            logger.warning("Invalid hardware probe output: %s", repr(exc))
++            return None
++        return payload if isinstance(payload, dict) else None
++
++
++class NativeWorkerFactory(WorkerFactory):
++    _NAME_PREFIXES = {
++        WorkerType.CPU: "native_worker_cpu_",
++        WorkerType.GPU: "native_worker_gpu_",
++    }
++
++    def __init__(self, system_principal: PrincipalContext) -> None:
++        super().__init__(system_principal)
++        self._rm = ResourceManager.get_instance()
++        self._name_counter: Counter[str] = Counter()
++
++    def create_worker(
++        self, token: WorkerTokenType, config: NativeWorkerConfig
++    ) -> NativeWorkerAdapter:
++        cuda_devices: list[int] | None
++        gpu_arch: GpuArch | None
++        match config.worker_type:
++            case WorkerType.CPU:
++                cuda_devices = gpu_arch = None
++            case WorkerType.GPU:
++                cuda_devices, gpu_arch = self._rm.reserve_gpus(
++                    devices=config.cuda_devices,
++                    n=config.gpu_count if config.cuda_devices is None else None,
++                )
++            case _:
++                raise ValueError(f"Unsupported worker type: {config.worker_type}")
++
++        name = config.worker_alias or self._next_name(config.worker_type)
++        return NativeWorkerAdapter(
++            token=token,
++            name=name,
++            command=list(config.command) if config.command else [],
++            cuda_devices=cuda_devices,
++            gpu_arch=gpu_arch,
++            config=config,
++            owner=self.system_principal,
++        )
++
++    def destroy_worker(self, worker: WorkerAdapter) -> None:
++        if not isinstance(worker, NativeWorkerAdapter):
++            raise ValueError("Invalid worker type")
++        if worker.cuda_devices:
++            self._rm.deallocate_gpus(worker.cuda_devices)
++
++    def _next_name(self, worker_type: WorkerType) -> str:
++        prefix = self._NAME_PREFIXES[worker_type]
++        index = self._name_counter[prefix]
++        self._name_counter[prefix] = index + 1
++        return f"{prefix}{index}"
++
++
++def get_provider_spec(system_principal: PrincipalContext) -> ProviderSpec:
++    return ProviderSpec(
++        name=_PROVIDER_NAME,
++        config_cls=NativeWorkerConfig,
++        adapter_cls=NativeWorkerAdapter,
++        factory=NativeWorkerFactory(system_principal),
++    )
+diff --git a/src/server/supervisor/manager.py b/src/server/supervisor/manager.py
+index 75d8c62..896e9b8 100644
+--- a/src/server/supervisor/manager.py
++++ b/src/server/supervisor/manager.py
+@@ -10,6 +10,7 @@ from pydantic import BaseModel, ConfigDict, Field
+ from ..hooks import PrincipalContext
+ from .adapters.base import ProviderSpec, WorkerAdapter, WorkerTokenType
+ from .adapters.docker import get_provider_spec as docker_provider_spec
++from .adapters.native import get_provider_spec as native_provider_spec
+ from .adapters.vastai import get_provider_spec as vastai_provider_spec
+ from .registry import WorkerRegistry
+ from .schemas import WorkerInfo, WorkerStatus
+@@ -68,10 +69,23 @@ class WorkerManager:
+         self._default_worker_config: dict[str, Any] | None = None
+         self._is_started: bool = False
+         self._capacity_change_callback = capacity_change_callback
+-        specs = [
+-            docker_provider_spec(system_principal),
+-            vastai_provider_spec(system_principal),
+-        ]
++        # Provider specs are built defensively: on hosts without Docker the
++        # docker provider constructor raises (docker.from_env is eager), and
++        # that must not prevent other providers (e.g. `native`) from loading.
++        specs: list[ProviderSpec] = []
++        for builder in (
++            docker_provider_spec,
++            vastai_provider_spec,
++            native_provider_spec,
++        ):
++            try:
++                specs.append(builder(system_principal))
++            except Exception as exc:
++                logger.warning(
++                    "Worker provider %s unavailable: %s",
++                    getattr(builder, "__name__", builder),
++                    exc,
++                )
+         self._providers: dict[str, ProviderSpec] = {spec.name: spec for spec in specs}
+ 
+     @property
+diff --git a/src/server/supervisor/resource_manager.py b/src/server/supervisor/resource_manager.py
+index 607d72b..46eface 100644
+--- a/src/server/supervisor/resource_manager.py
++++ b/src/server/supervisor/resource_manager.py
+@@ -1,4 +1,6 @@
++import os
+ import re
++import subprocess
+ from enum import StrEnum
+ from typing import Any
+ 
+@@ -40,7 +42,12 @@ class ResourceManager:
+     _instance: "ResourceManager | None" = None
+ 
+     def __init__(self) -> None:
+-        self._docker_client = get_docker_client()
++        try:
++            self._docker_client = get_docker_client()
++        except Exception:
++            # No Docker on this host: fall back to host-level probing so the
++            # native worker provider still works.
++            self._docker_client = None
+         self._env = self._detect_machine_env()
+ 
+     @classmethod
+@@ -103,8 +110,12 @@ class ResourceManager:
+         self._env.available_gpus.update(devices)
+ 
+     def _detect_machine_env(self) -> MachineEnv:
+-        info = self._docker_client.info()
+-        cpu_count = info.get("NCPU", 0)
++        cpu_count = os.cpu_count() or 0
++        if self._docker_client is not None:
++            try:
++                cpu_count = self._docker_client.info().get("NCPU", cpu_count)
++            except Exception:
++                pass
+ 
+         gpu_families: dict[int, GpuArch] = {}
+         available_gpus: set[int] = set()
+@@ -123,18 +134,34 @@ class ResourceManager:
+         if visible_devices is None or len(visible_devices) > 0:
+             # Detect GPUs using nvidia-smi if available
+             try:
+-                optional_kwargs: dict[str, Any] = {}
+-                if env.DOCKER_GPU_RUNTIME is not None:
+-                    optional_kwargs["runtime"] = env.DOCKER_GPU_RUNTIME
+-                nvidia_smi_output = self._docker_client.containers.run(
+-                    image=env.SERVER_CUDA_PROBE_IMAGE,
+-                    device_requests=[DeviceRequest(count=-1, capabilities=[["gpu"]])],
+-                    command="nvidia-smi --query-gpu=index,name --format=csv,noheader",
+-                    remove=True,
+-                    **optional_kwargs,
+-                )
+-                output_str = nvidia_smi_output.decode("utf-8").strip()
++                if self._docker_client is not None:
++                    optional_kwargs: dict[str, Any] = {}
++                    if env.DOCKER_GPU_RUNTIME is not None:
++                        optional_kwargs["runtime"] = env.DOCKER_GPU_RUNTIME
++                    nvidia_smi_output = self._docker_client.containers.run(
++                        image=env.SERVER_CUDA_PROBE_IMAGE,
++                        device_requests=[
++                            DeviceRequest(count=-1, capabilities=[["gpu"]])
++                        ],
++                        command="nvidia-smi --query-gpu=index,name --format=csv,noheader",
++                        remove=True,
++                        **optional_kwargs,
++                    )
++                    output_str = nvidia_smi_output.decode("utf-8").strip()
++                else:
++                    output_str = subprocess.run(
++                        [
++                            "nvidia-smi",
++                            "--query-gpu=index,name",
++                            "--format=csv,noheader",
++                        ],
++                        capture_output=True,
++                        text=True,
++                        timeout=30,
++                    ).stdout.strip()
+                 for line in output_str.split("\n"):
++                    if "," not in line:
++                        continue
+                     index_str, name = line.split(",", maxsplit=1)
+                     index = int(index_str.strip())
+                     if visible_devices is None or index in visible_devices:
+diff --git a/src/worker/hw.py b/src/worker/hw.py
+index 9c638ae..9ad815b 100644
+--- a/src/worker/hw.py
++++ b/src/worker/hw.py
+@@ -114,38 +114,44 @@ def collect_hw(*, bandwidth_bytes_per_sec: float | None = None) -> WorkerHardwar
+     cuda_version: str | None = None
+     devices: list[GpuInfo] = []
+     unified_memory = False
+-    try:
+-        pynvml.nvmlInit()
+-        raw = pynvml.nvmlSystemGetDriverVersion()
+-        driver_version = raw.decode() if isinstance(raw, bytes) else raw
+-        cuda_raw = pynvml.nvmlSystemGetCudaDriverVersion()
+-        cuda_version = f"{cuda_raw // 1000}.{(cuda_raw % 1000) // 10}"
+-        for idx in range(pynvml.nvmlDeviceGetCount()):
+-            handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
+-            name_raw = pynvml.nvmlDeviceGetName(handle)
+-            uuid_raw = pynvml.nvmlDeviceGetUUID(handle)
+-            name = name_raw.decode() if isinstance(name_raw, bytes) else name_raw
+-            uuid = uuid_raw.decode() if isinstance(uuid_raw, bytes) else uuid_raw
+-            gpu_uses_unified_memory = _device_uses_unified_memory(idx, name)
+-            unified_memory = unified_memory or gpu_uses_unified_memory
+-            mem_total: int | None = None
+-            if not gpu_uses_unified_memory:
+-                try:
+-                    mem_total_raw = pynvml.nvmlDeviceGetMemoryInfo(handle).total
+-                except pynvml.NVMLError:
+-                    mem_total_raw = None
+-                if mem_total_raw:
+-                    mem_total = int(mem_total_raw)
+-            devices.append(
+-                GpuInfo(
+-                    index=idx,
+-                    name=name,
+-                    uuid=uuid,
+-                    memory_total_bytes=mem_total,
++    collect_gpu = os.environ.get("FLOWMESH_COLLECT_GPU", "1").strip().lower() not in (
++        "0",
++        "false",
++        "no",
++    )
++    if collect_gpu:
++        try:
++            pynvml.nvmlInit()
++            raw = pynvml.nvmlSystemGetDriverVersion()
++            driver_version = raw.decode() if isinstance(raw, bytes) else raw
++            cuda_raw = pynvml.nvmlSystemGetCudaDriverVersion()
++            cuda_version = f"{cuda_raw // 1000}.{(cuda_raw % 1000) // 10}"
++            for idx in range(pynvml.nvmlDeviceGetCount()):
++                handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
++                name_raw = pynvml.nvmlDeviceGetName(handle)
++                uuid_raw = pynvml.nvmlDeviceGetUUID(handle)
++                name = name_raw.decode() if isinstance(name_raw, bytes) else name_raw
++                uuid = uuid_raw.decode() if isinstance(uuid_raw, bytes) else uuid_raw
++                gpu_uses_unified_memory = _device_uses_unified_memory(idx, name)
++                unified_memory = unified_memory or gpu_uses_unified_memory
++                mem_total: int | None = None
++                if not gpu_uses_unified_memory:
++                    try:
++                        mem_total_raw = pynvml.nvmlDeviceGetMemoryInfo(handle).total
++                    except pynvml.NVMLError:
++                        mem_total_raw = None
++                    if mem_total_raw:
++                        mem_total = int(mem_total_raw)
++                devices.append(
++                    GpuInfo(
++                        index=idx,
++                        name=name,
++                        uuid=uuid,
++                        memory_total_bytes=mem_total,
++                    )
+                 )
+-            )
+-    except pynvml.NVMLError:
+-        pass
++        except pynvml.NVMLError:
++            pass
+     gpu = GpuPlatformInfo(
+         driver_version=driver_version,
+         cuda_version=cuda_version,
+-- 
+2.50.1 (Apple Git-155)
+
