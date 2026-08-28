@@ -1,7 +1,7 @@
 [project]
 name = "analytics-agent"
 version = "0.1.0"
-description = "Student C analytics-agent plug point: lumid-gateway (local lumid-data-compatible data plane) now; nl2workflow/execute/learn/publish_gate in later phases."
+description = "analytics-agent plug point for the local lakehouse agent: lumid-gateway data plane + baseline nl2workflow and structural scorer."
 requires-python = ">=3.12"
 dependencies = [
     "fastapi>=0.115",
