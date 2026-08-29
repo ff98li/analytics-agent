@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import csv
 import io
 import json
@@ -10,6 +11,7 @@ from typing import Any
 from uuid import uuid4
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response
+from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field
 
 from .config import GatewayConfig, load_config
@@ -93,9 +95,48 @@ def create_app(
         data = buf.getvalue().encode("utf-8")
         return data, rowcount, len(data)
 
-    @app.get("/healthz")
-    async def healthz() -> dict[str, str]:
+    @app.get("/livez")
+    async def livez() -> dict[str, str]:
         return {"status": "ok"}
+
+    async def _probe(check: Any) -> dict[str, str]:
+        try:
+            await asyncio.wait_for(
+                asyncio.to_thread(check, cfg.health_timeout_seconds),
+                timeout=cfg.health_timeout_seconds,
+            )
+        except TimeoutError:
+            return {"status": "error", "reason": "timeout"}
+        except Exception:
+            # Database/S3 exceptions can contain endpoints, usernames, signed
+            # URLs, or credential metadata. Keep the public response generic.
+            return {"status": "error", "reason": "unavailable"}
+        return {"status": "ok"}
+
+    @app.get("/healthz")
+    @app.get("/readyz")
+    async def readyz() -> JSONResponse:
+        if db is None:
+            database_check: dict[str, str] = {
+                "status": "error",
+                "reason": "unconfigured",
+            }
+            s3_check = await _probe(storage.check_ready)
+        else:
+            database_check, s3_check = await asyncio.gather(
+                _probe(db.check_ready),
+                _probe(storage.check_ready),
+            )
+        checks = {"database": database_check, "s3": s3_check}
+        ready = all(check["status"] == "ok" for check in checks.values())
+        return JSONResponse(
+            status_code=200 if ready else 503,
+            content={
+                "ok": ready,
+                "status": "ok" if ready else "not_ready",
+                "checks": checks,
+            },
+        )
 
     @app.post("/retrieve", dependencies=[Depends(require_auth)])
     async def retrieve(body: RetrieveRequest) -> RetrieveResponse:

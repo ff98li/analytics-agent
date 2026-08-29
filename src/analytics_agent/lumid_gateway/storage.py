@@ -43,6 +43,26 @@ class Storage:
             kwargs["aws_access_key_id"] = cfg.s3_access_key
             kwargs["aws_secret_access_key"] = cfg.s3_secret_key
         self._client = boto3.client(**kwargs)
+        health_kwargs = dict(kwargs)
+        health_kwargs["config"] = BotoConfig(
+            signature_version="s3v4",
+            connect_timeout=cfg.health_timeout_seconds,
+            read_timeout=cfg.health_timeout_seconds,
+            retries={"mode": "standard", "total_max_attempts": 1},
+        )
+        self._health_client = boto3.client(**health_kwargs)
+
+    def check_ready(self, timeout_seconds: float) -> None:
+        """Authenticate to S3 and verify both configured buckets exist.
+
+        The health client is constructed with short connect/read timeouts. No
+        object is written, so readiness checks cannot leave probe artifacts.
+        """
+        del timeout_seconds  # timeout is fixed on the dedicated health client
+        for bucket in dict.fromkeys(
+            (self._private_bucket, self._public_bucket)
+        ):
+            self._health_client.head_bucket(Bucket=bucket)
 
     def bucket_for_key(self, key: str) -> str:
         """Resolve the partition bucket for a blob key."""

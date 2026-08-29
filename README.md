@@ -48,7 +48,13 @@ side) and `lumid_data_connector.py` (FlowMesh, worker side):
 - `GET /blobs?prefix=&delimiter=&limit=` → `{objects:[{key,size}], truncated}`
 - `PUT /blobs/<key>` / `GET /blobs/<key>` (404 when missing; 413 over quota)
 - `GET /catalog/tables/<schema>/<table>` → `{columns:[{name}]}` (404 when absent)
-- `GET /healthz`
+- `GET /livez` reports process/event-loop liveness without touching external
+  services.
+- `GET /readyz` verifies PostgreSQL with a read-only `SELECT 1` and verifies
+  authenticated access to both configured S3 buckets with `HEAD Bucket`.
+  It returns `ok: true` only when both checks pass, or HTTP 503 with
+  per-dependency `error`/`unconfigured` status when the gateway cannot serve
+  requests. `GET /healthz` is a compatibility alias for this readiness check.
 
 Bucket routing implements the two-tier storage partition the privacy gate will build on: a
 public-read-only bucket and a private-read-write bucket, routed on the first key segment.
@@ -64,8 +70,12 @@ uv run uvicorn analytics_agent.lumid_gateway.app:create_app --factory --host 127
 
 Config (env): `LUMID_GATEWAY_DATABASE_URL`, `LUMID_GATEWAY_S3_ENDPOINT_URL`,
 `LUMID_GATEWAY_S3_ACCESS_KEY`, `LUMID_GATEWAY_S3_SECRET_KEY`, `LUMID_GATEWAY_S3_BUCKET`,
-`LUMID_GATEWAY_S3_REGION`, `LUMID_GATEWAY_TOKEN` (optional; unset = no auth, local mode),
+`LUMID_GATEWAY_S3_PUBLIC_BUCKET`, `LUMID_GATEWAY_S3_REGION`, `LUMID_GATEWAY_TOKEN`
+(optional; unset = no auth, local mode),
 `LUMID_GATEWAY_MAX_BLOB_BYTES` (default 1 GiB), `LUMID_GATEWAY_MAX_RESULT_BYTES` (default 512 MiB).
+Readiness probes default to a two-second timeout, configurable from 0.1 to 10 seconds with
+`LUMID_GATEWAY_HEALTH_TIMEOUT_SECONDS`; probe failures never echo backend exception text or
+credentials in the response.
 
 ## `nl2workflow`
 

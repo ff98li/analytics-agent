@@ -21,6 +21,13 @@ class FakeDB:
         self.rows = rows if rows is not None else []
         self.columns: list[str] | None = None
         self.fail_with: Exception | None = None
+        self.health_fail_with: Exception | None = None
+        self.health_timeouts: list[float] = []
+
+    def check_ready(self, timeout_seconds: float) -> None:
+        self.health_timeouts.append(timeout_seconds)
+        if self.health_fail_with is not None:
+            raise self.health_fail_with
 
     @contextmanager
     def select(self, sql: str, params: dict | None = None):
@@ -38,6 +45,13 @@ class FakeStorage:
 
     def __init__(self) -> None:
         self.objects: dict[str, tuple[bytes, str]] = {}
+        self.health_fail_with: Exception | None = None
+        self.health_timeouts: list[float] = []
+
+    def check_ready(self, timeout_seconds: float) -> None:
+        self.health_timeouts.append(timeout_seconds)
+        if self.health_fail_with is not None:
+            raise self.health_fail_with
 
     def put_blob(self, key: str, body: bytes, content_type: str, max_bytes: int) -> None:
         from analytics_agent.lumid_gateway.storage import QuotaExceeded
@@ -88,11 +102,90 @@ def make_client(
     return TestClient(app)
 
 
-def test_healthz() -> None:
-    with make_client() as client:
-        resp = client.get("/healthz")
+def test_livez_is_independent_of_dependencies() -> None:
+    db = FakeDB()
+    db.health_fail_with = RuntimeError("database unavailable")
+    storage = FakeStorage()
+    storage.health_fail_with = RuntimeError("S3 unavailable")
+    with make_client(db=db, storage=storage) as client:
+        resp = client.get("/livez")
         assert resp.status_code == 200
         assert resp.json() == {"status": "ok"}
+        assert db.health_timeouts == []
+        assert storage.health_timeouts == []
+
+
+def test_readyz_and_healthz_check_dependencies() -> None:
+    db = FakeDB()
+    storage = FakeStorage()
+    expected = {
+        "ok": True,
+        "status": "ok",
+        "checks": {"database": {"status": "ok"}, "s3": {"status": "ok"}},
+    }
+    with make_client(db=db, storage=storage) as client:
+        for path in ("/readyz", "/healthz"):
+            resp = client.get(path)
+            assert resp.status_code == 200
+            assert resp.json() == expected
+    assert db.health_timeouts == [2.0, 2.0]
+    assert storage.health_timeouts == [2.0, 2.0]
+
+
+def test_readyz_reports_database_failure_without_leaking_details() -> None:
+    db = FakeDB()
+    db.health_fail_with = RuntimeError(
+        "connection to postgresql://user:sekret@private-host failed"
+    )
+    with make_client(db=db) as client:
+        resp = client.get("/readyz")
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "ok": False,
+        "status": "not_ready",
+        "checks": {
+            "database": {"status": "error", "reason": "unavailable"},
+            "s3": {"status": "ok"},
+        },
+    }
+    assert "sekret" not in resp.text
+    assert "private-host" not in resp.text
+
+
+def test_readyz_reports_s3_failure_without_leaking_details() -> None:
+    storage = FakeStorage()
+    storage.health_fail_with = RuntimeError(
+        "signed request for access_key=sekret failed"
+    )
+    with make_client(storage=storage) as client:
+        resp = client.get("/readyz")
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "ok": False,
+        "status": "not_ready",
+        "checks": {
+            "database": {"status": "ok"},
+            "s3": {"status": "error", "reason": "unavailable"},
+        },
+    }
+    assert "sekret" not in resp.text
+
+
+def test_readyz_reports_unconfigured_database() -> None:
+    cfg = GatewayConfig(database_url=None, s3_bucket="private", public_bucket="public")
+    storage = FakeStorage()
+    app = create_app(cfg=cfg, storage=storage)
+    with TestClient(app) as client:
+        resp = client.get("/readyz")
+    assert resp.status_code == 503
+    assert resp.json() == {
+        "ok": False,
+        "status": "not_ready",
+        "checks": {
+            "database": {"status": "error", "reason": "unconfigured"},
+            "s3": {"status": "ok"},
+        },
+    }
 
 
 def test_retrieve_jsonl() -> None:

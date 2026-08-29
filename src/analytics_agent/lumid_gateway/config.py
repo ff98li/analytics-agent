@@ -16,6 +16,19 @@ def _int_env(name: str, default: int) -> int:
         return default
 
 
+def _float_env(name: str, default: float) -> float:
+    raw = os.environ.get(name)
+    if not raw:
+        return default
+    try:
+        value = float(raw)
+    except ValueError:
+        return default
+    # Readiness probes must stay short even when the environment is
+    # accidentally misconfigured.
+    return min(max(value, 0.1), 10.0)
+
+
 @dataclass
 class GatewayConfig:
     database_url: str | None = field(
@@ -53,6 +66,11 @@ class GatewayConfig:
     )
     max_result_bytes: int = field(
         default_factory=lambda: _int_env("LUMID_GATEWAY_MAX_RESULT_BYTES", 512 * 1024**2)
+    )
+    health_timeout_seconds: float = field(
+        default_factory=lambda: _float_env(
+            "LUMID_GATEWAY_HEALTH_TIMEOUT_SECONDS", 2.0
+        )
     )
     #: Prefix for materialized query results inside the bucket.
     materialized_prefix: str = "materialized"

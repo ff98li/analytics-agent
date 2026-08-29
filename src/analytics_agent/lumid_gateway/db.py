@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from math import ceil
 from collections.abc import Iterator
 from contextlib import contextmanager
 from typing import Any
@@ -49,6 +50,24 @@ class DB:
         if not cfg.database_url:
             raise RuntimeError("LUMID_GATEWAY_DATABASE_URL is not configured")
         self._url = cfg.database_url
+
+    def check_ready(self, timeout_seconds: float) -> None:
+        """Verify that PostgreSQL accepts a small read-only query."""
+        statement_timeout_ms = max(1, int(timeout_seconds * 1000))
+        conninfo = psycopg.conninfo.make_conninfo(
+            self._url,
+            connect_timeout=max(1, ceil(timeout_seconds)),
+            options=(
+                "-c default_transaction_read_only=on "
+                f"-c statement_timeout={statement_timeout_ms}"
+            ),
+        )
+        with psycopg.connect(conninfo, row_factory=dict_row) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1 AS ready")
+                row = cur.fetchone()
+                if row is None or row.get("ready") != 1:
+                    raise RuntimeError("database readiness query returned no result")
 
     @contextmanager
     def select(
