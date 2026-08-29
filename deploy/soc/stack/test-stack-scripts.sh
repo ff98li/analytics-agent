@@ -126,6 +126,25 @@ if [ -r "/proc/$$/stat" ]; then
     test_child_pid=""
     stop_tracked_service ownership-failure 1 >/dev/null
     [ ! -e "$STACK_PID_DIR/ownership-failure.pid" ]
+
+    # Redis 5 may erase its own environment while updating the process title.
+    # The supervised-child mode keeps an exact, marker-bearing parent PID/PGID
+    # and still tears down the whole child group without a pattern kill.
+    mkdir -p "$STACK_RUNTIME_DIR/service-env"
+    supervised_env="$STACK_RUNTIME_DIR/service-env/selftest-supervised.env"
+    printf 'export STACK_DEPLOYMENT_ID=%q\nexport STACK_RUNTIME_DIR=%q\n' \
+        "$STACK_DEPLOYMENT_ID" "$STACK_RUNTIME_DIR" >"$supervised_env"
+    chmod 600 "$supervised_env"
+    start_tracked_service supervised "$STACK_ROOT/supervised.log" \
+        env -i "HOME=$HOME" "PATH=$PATH" \
+        "STACK_DEPLOYMENT_ID=$STACK_DEPLOYMENT_ID" \
+        "STACK_RUNTIME_DIR=$STACK_RUNTIME_DIR" \
+        bash "$SCRIPT_DIR/run-service.sh" --supervise-child \
+        "$supervised_env" "$STACK_ROOT" \
+        bash -c 'unset STACK_DEPLOYMENT_ID; exec sleep 30'
+    tracked_process_alive supervised
+    stop_tracked_service supervised 2 >/dev/null
+    [ ! -e "$STACK_PID_DIR/supervised.pid" ]
 fi
 
 echo "STACK_SCRIPT_SELF_TEST_OK"

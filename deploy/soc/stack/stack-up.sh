@@ -331,7 +331,8 @@ if ! tracked_process_alive redis; then
     start_tracked_service redis "$STACK_ROOT/logs/redis.log" \
         env -i "HOME=$HOME" "PATH=$PATH" \
         "STACK_DEPLOYMENT_ID=$STACK_DEPLOYMENT_ID" "STACK_RUNTIME_DIR=$STACK_RUNTIME_DIR" \
-        bash "$SCRIPT_DIR/run-service.sh" "$redis_env" "$STACK_ROOT" \
+        bash "$SCRIPT_DIR/run-service.sh" --supervise-child \
+        "$redis_env" "$STACK_ROOT" \
         redis-server "$redis_config"
 fi
 for _ in $(seq 1 30); do
