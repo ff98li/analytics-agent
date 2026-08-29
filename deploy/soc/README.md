@@ -10,6 +10,9 @@ never be copied back into Git.
 
 - `stack/`: authenticated PostgreSQL, MinIO, Redis, gateway, FlowMesh, and
   Lumilake lifecycle; atomic checkpoint/restore; layered health and E2E smoke.
+  Redis authentication is version-aware: Redis 6.2+ uses a named ACL user,
+  while older Redis uses a random `requirepass`; neither mode permits an
+  unauthenticated listener.
 - `jobs/`: focused install/check templates, including the corrected FlowMesh
   heredoc and Lumilake exit-code checks.
 - `workflows/`: the minimal SQL smoke workflow used by the project.
@@ -19,7 +22,7 @@ never be copied back into Git.
 The matching product branches are:
 
 - FlowMesh `ff98li/FlowMesh:codex/native-provider-hardening`, commit
-  `676c9aca8ba98a3f5d25ba8d3355a921a2662ef6`.
+  `0b8be48e711515e566a5125ff56b67166a997473`.
 - Lumilake `ff98li/Lumilake:codex/readiness-hardening`, commit
   `38ba3e503f4e131c29a2c8e8ee510108f0f59af3`.
 
@@ -43,6 +46,8 @@ base, the equivalent FlowMesh patch series is:
 ```bash
 git am vendor/flowmesh/0001-native-worker-provider.patch
 git am vendor/flowmesh/0002-fix-harden-worker-control-plane.patch
+git am vendor/flowmesh/0003-fix-redact-redis-connection-failures.patch
+git am vendor/flowmesh/0004-fix-redact-redis-lifecycle-logs.patch
 ```
 
 ## Validation boundary

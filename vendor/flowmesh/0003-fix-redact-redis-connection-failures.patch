@@ -1,0 +1,110 @@
+From 3c89ec6471e41e1e391e5fe53762c64d1665fe91 Mon Sep 17 00:00:00 2001
+From: ff98li <li.feifei.official@gmail.com>
+Date: Sat, 29 Aug 2026 19:51:03 +0800
+Subject: [PATCH] fix: redact Redis connection failures
+
+Signed-off-by: ff98li <li.feifei.official@gmail.com>
+---
+ src/server/clients/redis.py                   | 19 +++++--
+ tests/server/test_redis_connection_logging.py | 52 +++++++++++++++++++
+ 2 files changed, 67 insertions(+), 4 deletions(-)
+ create mode 100644 tests/server/test_redis_connection_logging.py
+
+diff --git a/src/server/clients/redis.py b/src/server/clients/redis.py
+index 4ad1fee..388f6fd 100644
+--- a/src/server/clients/redis.py
++++ b/src/server/clients/redis.py
+@@ -262,8 +262,14 @@ class SyncRedisClient:
+             )
+             client.ping()
+         except Exception as exc:
+-            self.logger.exception(
+-                "Failed to connect to %s Redis (%s): %s", label, url, exc
++            # Some client/transport exceptions echo their constructor input.
++            # Log only the exception type so credentials cannot re-enter via
++            # either the URL argument or a traceback message.
++            self.logger.error(
++                "Failed to connect to %s Redis (%s): %s",
++                label,
++                _redact_url(url),
++                type(exc).__name__,
+             )
+             raise SystemExit(1) from exc
+         self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
+@@ -468,8 +474,13 @@ class AsyncRedisClient:
+                 url, decode_responses=True, **_keepalive_kwargs(), **ssl_kwargs
+             )
+         except Exception as exc:
+-            self.logger.exception(
+-                "Failed to connect to %s Redis (%s): %s", label, url, exc
++            # See the synchronous path above: exception text is untrusted and
++            # may repeat a credential-bearing connection URL.
++            self.logger.error(
++                "Failed to connect to %s Redis (%s): %s",
++                label,
++                _redact_url(url),
++                type(exc).__name__,
+             )
+             raise SystemExit(1) from exc
+         self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
+diff --git a/tests/server/test_redis_connection_logging.py b/tests/server/test_redis_connection_logging.py
+new file mode 100644
+index 0000000..283a6ad
+--- /dev/null
++++ b/tests/server/test_redis_connection_logging.py
+@@ -0,0 +1,52 @@
++"""Redis connection failures redact credentials before logging."""
++
++import logging
++
++import pytest
++
++from server.clients import redis as redis_client_module
++from server.clients.redis import AsyncRedisClient, SyncRedisClient
++
++
++_REDIS_URL = "redis://flowmesh:test-password@localhost:6379/0"
++_REDACTED_URL = "redis://flowmesh:****@localhost:6379/0"
++
++
++def _raise_connection_error(*args: object, **kwargs: object) -> None:
++    raise ConnectionError(f"connection refused for {_REDIS_URL}")
++
++
++def test_sync_connection_failure_redacts_credentials(
++    monkeypatch: pytest.MonkeyPatch,
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    monkeypatch.setattr(redis_client_module, "_keepalive_kwargs", lambda: {})
++    monkeypatch.setattr(redis_client_module.redis, "from_url", _raise_connection_error)
++    logger = logging.getLogger("test.sync-redis-connection")
++
++    with pytest.raises(SystemExit):
++        SyncRedisClient(_REDIS_URL, _REDIS_URL, logger)
++
++    assert _REDACTED_URL in caplog.text
++    assert "ConnectionError" in caplog.text
++    assert _REDIS_URL not in caplog.text
++    assert "test-password" not in caplog.text
++
++
++def test_async_connection_failure_redacts_credentials(
++    monkeypatch: pytest.MonkeyPatch,
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    monkeypatch.setattr(redis_client_module, "_keepalive_kwargs", lambda: {})
++    monkeypatch.setattr(
++        redis_client_module.async_redis, "from_url", _raise_connection_error
++    )
++    logger = logging.getLogger("test.async-redis-connection")
++
++    with pytest.raises(SystemExit):
++        AsyncRedisClient(_REDIS_URL, _REDIS_URL, logger)
++
++    assert _REDACTED_URL in caplog.text
++    assert "ConnectionError" in caplog.text
++    assert _REDIS_URL not in caplog.text
++    assert "test-password" not in caplog.text
+-- 
+2.55.0
+

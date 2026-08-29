@@ -43,10 +43,16 @@ stop_writers() {
 }
 
 redis_cli() {
-    env -i "HOME=$HOME" "PATH=$PATH" \
-        "REDISCLI_AUTH=$STACK_REDIS_PASSWORD" redis-cli \
-        --no-auth-warning --user "$STACK_REDIS_USER" \
-        -h 127.0.0.1 -p "$STACK_REDIS_PORT" "$@"
+    if [ "$STACK_REDIS_AUTH_MODE" = "acl" ]; then
+        env -i "HOME=$HOME" "PATH=$PATH" \
+            "REDISCLI_AUTH=$STACK_REDIS_PASSWORD" redis-cli \
+            --no-auth-warning --user "$STACK_REDIS_USER" \
+            -h 127.0.0.1 -p "$STACK_REDIS_PORT" "$@"
+    else
+        env -i "HOME=$HOME" "PATH=$PATH" \
+            "REDISCLI_AUTH=$STACK_REDIS_PASSWORD" redis-cli \
+            -h 127.0.0.1 -p "$STACK_REDIS_PORT" "$@"
+    fi
 }
 
 stop_stores() {

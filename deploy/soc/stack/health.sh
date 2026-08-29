@@ -38,10 +38,16 @@ curl_probe() {
 }
 
 redis_cli() {
-    env -i "HOME=$HOME" "PATH=$PATH" \
-        "REDISCLI_AUTH=$STACK_REDIS_PASSWORD" redis-cli \
-        --no-auth-warning --user "$STACK_REDIS_USER" \
-        -h 127.0.0.1 -p "$STACK_REDIS_PORT" "$@"
+    if [ "$STACK_REDIS_AUTH_MODE" = "acl" ]; then
+        env -i "HOME=$HOME" "PATH=$PATH" \
+            "REDISCLI_AUTH=$STACK_REDIS_PASSWORD" redis-cli \
+            --no-auth-warning --user "$STACK_REDIS_USER" \
+            -h 127.0.0.1 -p "$STACK_REDIS_PORT" "$@"
+    else
+        env -i "HOME=$HOME" "PATH=$PATH" \
+            "REDISCLI_AUTH=$STACK_REDIS_PASSWORD" redis-cli \
+            -h 127.0.0.1 -p "$STACK_REDIS_PORT" "$@"
+    fi
 }
 
 minio_app_mc() {
@@ -82,6 +88,21 @@ redis_ready() {
     got="$(redis_cli get "$key")"
     redis_cli del "$key" >/dev/null
     [ "$got" = "$value" ]
+}
+
+redis_auth_enforced() {
+    local unauthenticated
+    unauthenticated="$(
+        env -i "HOME=$HOME" "PATH=$PATH" redis-cli \
+            -h 127.0.0.1 -p "$STACK_REDIS_PORT" ping 2>/dev/null || true
+    )"
+    case "$unauthenticated" in
+        *NOAUTH*|*WRONGPASS*) ;;
+        *) return 1 ;;
+    esac
+    if [ "$STACK_REDIS_AUTH_MODE" = "acl" ]; then
+        [ "$(redis_cli ACL WHOAMI 2>/dev/null)" = "$STACK_REDIS_USER" ]
+    fi
 }
 
 minio_ready_and_policies() {
@@ -248,6 +269,7 @@ if [ "$level" -ge 1 ]; then
     check "postgres SELECT/schema/non-superuser" postgres_ready
     check "postgres pg_hba SCRAM/no-trust" postgres_hba_ready
     check "redis authenticated TTL roundtrip" redis_ready
+    check "redis rejects unauthenticated clients" redis_auth_enforced
     check "minio auth + private/public policy roundtrip" minio_ready_and_policies
     check "gateway dependency readiness" curl_probe -fsS "http://127.0.0.1:$STACK_GATEWAY_PORT/readyz"
     check "gateway authenticated catalog" gateway_catalog_ready

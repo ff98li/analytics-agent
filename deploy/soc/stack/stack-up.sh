@@ -102,10 +102,16 @@ wait_http() {
 }
 
 redis_cli() {
-    env -i "HOME=$HOME" "PATH=$PATH" \
-        "REDISCLI_AUTH=$STACK_REDIS_PASSWORD" redis-cli \
-        --no-auth-warning --user "$STACK_REDIS_USER" \
-        -h 127.0.0.1 -p "$STACK_REDIS_PORT" "$@"
+    if [ "$STACK_REDIS_AUTH_MODE" = "acl" ]; then
+        env -i "HOME=$HOME" "PATH=$PATH" \
+            "REDISCLI_AUTH=$STACK_REDIS_PASSWORD" redis-cli \
+            --no-auth-warning --user "$STACK_REDIS_USER" \
+            -h 127.0.0.1 -p "$STACK_REDIS_PORT" "$@"
+    else
+        env -i "HOME=$HOME" "PATH=$PATH" \
+            "REDISCLI_AUTH=$STACK_REDIS_PASSWORD" redis-cli \
+            -h 127.0.0.1 -p "$STACK_REDIS_PORT" "$@"
+    fi
 }
 
 minio_root_mc() {
@@ -310,8 +316,12 @@ redis_config="$STACK_RUNTIME_DIR/redis.conf"
     printf 'port %s\n' "$STACK_REDIS_PORT"
     printf 'save ""\n'
     printf 'appendonly no\n'
-    printf 'user default off\n'
-    printf 'user %s on >%s ~* &* +@all\n' "$STACK_REDIS_USER" "$STACK_REDIS_PASSWORD"
+    if [ "$STACK_REDIS_AUTH_MODE" = "acl" ]; then
+        printf 'user default off\n'
+        printf 'user %s on >%s ~* &* +@all\n' "$STACK_REDIS_USER" "$STACK_REDIS_PASSWORD"
+    else
+        printf 'requirepass %s\n' "$STACK_REDIS_PASSWORD"
+    fi
 } >"$redis_config"
 chmod 600 "$redis_config"
 assert_port_free_or_owned redis "$STACK_REDIS_PORT"
@@ -328,8 +338,8 @@ for _ in $(seq 1 30); do
     redis_cli ping 2>/dev/null | grep -qx PONG && break
     sleep 1
 done
-redis_cli ping 2>/dev/null | grep -qx PONG || die "Redis ACL authentication failed"
-log "Redis ready (ACL user=$STACK_REDIS_USER; in-flight state is ephemeral)"
+redis_cli ping 2>/dev/null | grep -qx PONG || die "Redis authentication failed"
+log "Redis ready (auth_mode=$STACK_REDIS_AUTH_MODE; in-flight state is ephemeral)"
 
 # Python services ------------------------------------------------------------
 rm -f "$STACK_RUNTIME_DIR/writers.stopped"

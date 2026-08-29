@@ -84,7 +84,7 @@ Phase 1 的功能性里程碑是真实的：历史 Slurm job `740372` 在一个 
 | FM-02 | Critical | FlowMesh 默认无认证；部署 bind 变量不生效，HTTP/gRPC 可能监听所有网卡 | 代码/测试/GitHub Completed；SoC deploy 待完成 |
 | FM-03 | Critical/High | Docker provider 可被请求覆写镜像来源/版本、host path、container identity；SSH 模式挂载 Docker socket | request allowlist/test/GitHub Completed；operator socket residual |
 | FM-04 | High | VastAI 可被请求选择镜像/instance/credential 并消耗远端资源 | privileged field allowlist 本地已实现；预算/egress residual |
-| DATA-01 | Critical/High | PostgreSQL loopback `trust` + bootstrap superuser；Redis 无认证；固定 MinIO/gateway 凭据 | 本地 SCRAM/ACL/random secrets/role split 已实现；MinIO least privilege residual |
+| DATA-01 | Critical/High | PostgreSQL loopback `trust` + bootstrap superuser；Redis 无认证；固定 MinIO/gateway 凭据 | 本地 SCRAM/version-aware Redis auth/random secrets/least privilege 已实现；SoC retest 待完成 |
 | SEC-01 | High | `set -x` 在 source secrets 前开启，secret 进入 Slurm stderr | 新脚本本地已修；旧凭据/日志仍需处理 |
 | REL-01 | High | checkpoint 非原子、只备份一个 bucket，且完全没有 restore | 本地 atomic create/validate/restore 已实现；实机 drill 待完成 |
 | REL-02 | High | Slurm timeout/TERM 清理可能重复、继续循环或在 KILL 前未完成 | 本地 early signal/one-shot cleanup 已实现；TERM drill 待完成 |
@@ -257,7 +257,7 @@ VastAI provider 同样允许配置 `docker_registry`/`version`，最终将镜像
 **当前单节点 Phase 1**：属于中等规模部署改造，不需要改变 Lumilake/FlowMesh 调度算法，也通常不需要业务 schema migration。主要涉及：
 
 - `stack-env.sh` 的 secret file/generation、认证 URL 与正确 bind 变量；
-- `stack-up.sh` 的 PostgreSQL HBA/roles、Redis ACL、MinIO service account/bootstrap；
+- `stack-up.sh` 的 PostgreSQL HBA/roles、Redis ACL/requirepass、MinIO service account/bootstrap；
 - `health.sh`、checkpoint/restore、CLI/sbatch 对新凭据的使用；
 - FlowMesh 的 opt-in bearer 支持与 gateway/Lumilake readiness；
 - secrets 轮换及旧 stderr 处理。
@@ -268,7 +268,7 @@ VastAI provider 同样允许配置 `docker_registry`/`version`，最终将镜像
 
 - `stack-env.sh` 以 `umask 077` 在 allocation-scoped `/tmp/lumilake-stack-<job>/run/secrets.env` 原子生成随机 PostgreSQL admin/runtime、Redis、MinIO root/app、gateway 与 control-plane secrets；验证 owner/mode `0600`，相同 deployment 重载复用、不同 deployment 不复用。
 - PostgreSQL 改为 local/host `scram-sha-256`；bootstrap `lumilake_admin` 与 `NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION` runtime `lumilake` 分离，gateway/health 只用 runtime role。
-- Redis default user 关闭，随机 ACL user/password 启用；FlowMesh URLs 与 health 使用认证。
+- Redis 6.2+ 关闭 default user 并启用随机 named ACL；6.0/6.1 缺少所需 Pub/Sub channel ACL，SoC 的 Redis 5.0.3 更不支持 ACL，因此旧版本自动使用随机 `requirepass`。两种模式都会同步生成带认证的 FlowMesh URL/CLI/health 配置，绝不回退到无密码。
 - Lumilake 会把调用者 bearer 转发给 FlowMesh，因此静态单租户模式下两者共享同一个随机 control-plane bearer；gateway 使用另一个独立随机 bearer。curl bearer 放在 `0600` config 中，避免出现在 argv。
 - FlowMesh HTTP/gRPC loopback bind、gRPC TLS/worker token、无关 proxy disable 已接线。
 
@@ -683,7 +683,7 @@ Slurm/NVIDIA 环境中的 `CUDA_VISIBLE_DEVICES` 不保证是简单 host index�
 
 1. 停止继续使用旧固定值；在不打印值的前提下生成/安装新的 mode `0600` secrets。
 2. 先合并并测试 FlowMesh API/native/Docker/GPU/stop 修复；确保默认配置与 stack 的 bearer/bind 一致。
-3. 部署 PostgreSQL SCRAM + 独立 runtime role、Redis ACL、MinIO least-privilege account；更新所有 URL/CLI/probes。
+3. 部署 PostgreSQL SCRAM + 独立 runtime role、Redis ACL/requirepass、MinIO least-privilege account；更新所有 URL/CLI/probes。
 4. 部署 PID/PGID lifecycle 与一次性 signal cleanup，去掉所有宽泛 `pkill -f`。
 5. 部署 atomic checkpoint/restore 和 seed 幂等；先做离线 fixture test，再做 <=1h Slurm restore drill。
 6. 统一 `/livez`/`readyz` schema；运行 gateway、FlowMesh、Lumilake 单测和 stack L1。

@@ -241,14 +241,58 @@ export STACK_S3_PUBLIC_BUCKET="${STACK_S3_PUBLIC_BUCKET:-lumilake-public}"
 STACK_MINIO_ROOT_MC_URL="http://${MINIO_ROOT_USER}:${MINIO_ROOT_PASSWORD}@127.0.0.1:${STACK_MINIO_PORT}"
 STACK_MINIO_APP_MC_URL="http://${MINIO_APP_USER}:${MINIO_APP_PASSWORD}@127.0.0.1:${STACK_MINIO_PORT}"
 
-# Redis ACL: the default user is disabled by stack-up.sh. Hex passwords are
-# URL-safe and therefore can be embedded in client URLs without escaping.
+# Redis 6.2+ uses a named ACL user with an explicit Pub/Sub channel pattern.
+# Redis 6.0/6.1 do not support that rule and the SoC image currently ships
+# Redis 5, so auto mode uses a random requirepass on all older versions rather
+# than ever starting an unauthenticated listener. Hex passwords are URL-safe.
 export STACK_REDIS_USER="${STACK_REDIS_USER:-flowmesh}"
-export REDIS_URL="redis://${STACK_REDIS_USER}:${STACK_REDIS_PASSWORD}@127.0.0.1:${STACK_REDIS_PORT}/0"
+stack_redis_auth_mode="${STACK_REDIS_AUTH_MODE:-auto}"
+if [ "$stack_redis_auth_mode" = "auto" ]; then
+    stack_redis_version=""
+    stack_redis_major=""
+    stack_redis_minor=""
+    stack_redis_cli_has_user=false
+    if command -v redis-server >/dev/null 2>&1; then
+        stack_redis_version="$(redis-server --version 2>/dev/null || true)"
+        stack_redis_major="$(printf '%s\n' "$stack_redis_version" | sed -n 's/.*v=\([0-9][0-9]*\)\.[0-9][0-9]*.*/\1/p')"
+        stack_redis_minor="$(printf '%s\n' "$stack_redis_version" | sed -n 's/.*v=[0-9][0-9]*\.\([0-9][0-9]*\).*/\1/p')"
+    fi
+    if command -v redis-cli >/dev/null 2>&1; then
+        case "$(redis-cli --help 2>&1 || true)" in
+            *--user*) stack_redis_cli_has_user=true ;;
+        esac
+    fi
+    if [ -n "$stack_redis_major" ] && [ -n "$stack_redis_minor" ] && \
+        { [ "$stack_redis_major" -gt 6 ] || \
+            { [ "$stack_redis_major" -eq 6 ] && [ "$stack_redis_minor" -ge 2 ]; }; } && \
+        [ "$stack_redis_cli_has_user" = true ]; then
+        stack_redis_auth_mode=acl
+    else
+        stack_redis_auth_mode=password
+    fi
+fi
+case "$stack_redis_auth_mode" in
+    acl)
+        export REDIS_URL="redis://${STACK_REDIS_USER}:${STACK_REDIS_PASSWORD}@127.0.0.1:${STACK_REDIS_PORT}/0"
+        export REDIS_ACL_ENABLED="true"
+        export REDIS_USERNAME="$STACK_REDIS_USER"
+        ;;
+    password)
+        export REDIS_URL="redis://:${STACK_REDIS_PASSWORD}@127.0.0.1:${STACK_REDIS_PORT}/0"
+        export REDIS_ACL_ENABLED="false"
+        export REDIS_USERNAME=""
+        ;;
+    *)
+        stack_env_fail "STACK_REDIS_AUTH_MODE must be auto, acl, or password" || {
+            return 1 2>/dev/null || exit 1
+        }
+        ;;
+esac
+export STACK_REDIS_AUTH_MODE="$stack_redis_auth_mode"
+unset stack_redis_auth_mode stack_redis_version stack_redis_major \
+    stack_redis_minor stack_redis_cli_has_user
 export REDIS_CONTROL_URL="$REDIS_URL"
 export REDIS_TELEMETRY_URL="$REDIS_URL"
-export REDIS_ACL_ENABLED="true"
-export REDIS_USERNAME="$STACK_REDIS_USER"
 export REDIS_PASSWORD="$STACK_REDIS_PASSWORD"
 
 # lumid-gateway.

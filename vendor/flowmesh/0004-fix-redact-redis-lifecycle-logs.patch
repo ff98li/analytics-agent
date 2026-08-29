@@ -1,0 +1,195 @@
+From 0b8be48e711515e566a5125ff56b67166a997473 Mon Sep 17 00:00:00 2001
+From: ff98li <li.feifei.official@gmail.com>
+Date: Sat, 29 Aug 2026 19:56:56 +0800
+Subject: [PATCH] fix: redact Redis lifecycle logs
+
+Signed-off-by: ff98li <li.feifei.official@gmail.com>
+---
+ src/server/clients/redis.py                   | 35 +++++---
+ tests/server/test_redis_connection_logging.py | 84 +++++++++++++++++--
+ 2 files changed, 101 insertions(+), 18 deletions(-)
+
+diff --git a/src/server/clients/redis.py b/src/server/clients/redis.py
+index 388f6fd..ee26946 100644
+--- a/src/server/clients/redis.py
++++ b/src/server/clients/redis.py
+@@ -271,9 +271,12 @@ class SyncRedisClient:
+                 _redact_url(url),
+                 type(exc).__name__,
+             )
+-            raise SystemExit(1) from exc
+-        self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
+-        return client
++        else:
++            self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
++            return client
++        # Raise after leaving the handler so a credential-bearing exception is
++        # not retained as SystemExit.__context__ for a future crash reporter.
++        raise SystemExit(1)
+ 
+     # ---- String helpers ----
+     def get(self, key: str) -> str | None:
+@@ -419,9 +422,14 @@ class SyncRedisClient:
+     # ---- Maintenance ----
+     def flush_all(self) -> None:
+         self._control.flushdb()
+-        self.logger.info("Cleared Redis database at %s (control)", self.control_url)
++        self.logger.info(
++            "Cleared Redis database at %s (control)", _redact_url(self.control_url)
++        )
+         self._telemetry.flushdb()
+-        self.logger.info("Cleared Redis database at %s (telemetry)", self.telemetry_url)
++        self.logger.info(
++            "Cleared Redis database at %s (telemetry)",
++            _redact_url(self.telemetry_url),
++        )
+ 
+ 
+ def _awaitable[T](value: Awaitable[T] | T) -> Awaitable[T]:
+@@ -482,9 +490,11 @@ class AsyncRedisClient:
+                 _redact_url(url),
+                 type(exc).__name__,
+             )
+-            raise SystemExit(1) from exc
+-        self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
+-        return client
++        else:
++            self.logger.info("Connected to %s Redis: %s", label, _redact_url(url))
++            return client
++        # Match the synchronous path and deliberately discard exception text.
++        raise SystemExit(1)
+ 
+     # ---- String helpers ----
+     async def get(self, key: str) -> str | None:
+@@ -650,9 +660,14 @@ class AsyncRedisClient:
+ 
+     async def flush_all(self) -> None:
+         await self._control.flushdb()
+-        self.logger.info("Cleared Redis database at %s (control)", self.control_url)
++        self.logger.info(
++            "Cleared Redis database at %s (control)", _redact_url(self.control_url)
++        )
+         await self._telemetry.flushdb()
+-        self.logger.info("Cleared Redis database at %s (telemetry)", self.telemetry_url)
++        self.logger.info(
++            "Cleared Redis database at %s (telemetry)",
++            _redact_url(self.telemetry_url),
++        )
+ 
+ 
+ class RedisClient:
+diff --git a/tests/server/test_redis_connection_logging.py b/tests/server/test_redis_connection_logging.py
+index 283a6ad..a8faa24 100644
+--- a/tests/server/test_redis_connection_logging.py
++++ b/tests/server/test_redis_connection_logging.py
+@@ -16,6 +16,27 @@ def _raise_connection_error(*args: object, **kwargs: object) -> None:
+     raise ConnectionError(f"connection refused for {_REDIS_URL}")
+ 
+ 
++class _SyncPingFailure:
++    def ping(self) -> None:
++        raise ConnectionError(f"connection refused for {_REDIS_URL}")
++
++
++class _SyncFlushClient:
++    def flushdb(self) -> None:
++        return None
++
++
++class _AsyncFlushClient:
++    async def flushdb(self) -> None:
++        return None
++
++
++def _assert_secret_absent(caplog: pytest.LogCaptureFixture) -> None:
++    assert _REDACTED_URL in caplog.text
++    assert _REDIS_URL not in caplog.text
++    assert "test-password" not in caplog.text
++
++
+ def test_sync_connection_failure_redacts_credentials(
+     monkeypatch: pytest.MonkeyPatch,
+     caplog: pytest.LogCaptureFixture,
+@@ -24,13 +45,32 @@ def test_sync_connection_failure_redacts_credentials(
+     monkeypatch.setattr(redis_client_module.redis, "from_url", _raise_connection_error)
+     logger = logging.getLogger("test.sync-redis-connection")
+ 
+-    with pytest.raises(SystemExit):
++    with pytest.raises(SystemExit) as caught:
+         SyncRedisClient(_REDIS_URL, _REDIS_URL, logger)
+ 
+-    assert _REDACTED_URL in caplog.text
++    assert caught.value.__context__ is None
+     assert "ConnectionError" in caplog.text
+-    assert _REDIS_URL not in caplog.text
+-    assert "test-password" not in caplog.text
++    _assert_secret_absent(caplog)
++
++
++def test_sync_ping_failure_redacts_credentials(
++    monkeypatch: pytest.MonkeyPatch,
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    monkeypatch.setattr(redis_client_module, "_keepalive_kwargs", lambda: {})
++    monkeypatch.setattr(
++        redis_client_module.redis,
++        "from_url",
++        lambda *args, **kwargs: _SyncPingFailure(),
++    )
++    logger = logging.getLogger("test.sync-redis-ping")
++
++    with pytest.raises(SystemExit) as caught:
++        SyncRedisClient(_REDIS_URL, _REDIS_URL, logger)
++
++    assert caught.value.__context__ is None
++    assert "ConnectionError" in caplog.text
++    _assert_secret_absent(caplog)
+ 
+ 
+ def test_async_connection_failure_redacts_credentials(
+@@ -43,10 +83,38 @@ def test_async_connection_failure_redacts_credentials(
+     )
+     logger = logging.getLogger("test.async-redis-connection")
+ 
+-    with pytest.raises(SystemExit):
++    with pytest.raises(SystemExit) as caught:
+         AsyncRedisClient(_REDIS_URL, _REDIS_URL, logger)
+ 
+-    assert _REDACTED_URL in caplog.text
++    assert caught.value.__context__ is None
+     assert "ConnectionError" in caplog.text
+-    assert _REDIS_URL not in caplog.text
+-    assert "test-password" not in caplog.text
++    _assert_secret_absent(caplog)
++
++
++def test_sync_flush_logs_redacted_urls(caplog: pytest.LogCaptureFixture) -> None:
++    client = SyncRedisClient.__new__(SyncRedisClient)
++    client.control_url = _REDIS_URL
++    client.telemetry_url = _REDIS_URL
++    client.logger = logging.getLogger("test.sync-redis-flush")
++    client._control = _SyncFlushClient()  # type: ignore[assignment]
++    client._telemetry = _SyncFlushClient()  # type: ignore[assignment]
++
++    client.flush_all()
++
++    _assert_secret_absent(caplog)
++
++
++@pytest.mark.anyio
++async def test_async_flush_logs_redacted_urls(
++    caplog: pytest.LogCaptureFixture,
++) -> None:
++    client = AsyncRedisClient.__new__(AsyncRedisClient)
++    client.control_url = _REDIS_URL
++    client.telemetry_url = _REDIS_URL
++    client.logger = logging.getLogger("test.async-redis-flush")
++    client._control = _AsyncFlushClient()  # type: ignore[assignment]
++    client._telemetry = _AsyncFlushClient()  # type: ignore[assignment]
++
++    await client.flush_all()
++
++    _assert_secret_absent(caplog)
+-- 
+2.55.0
+
