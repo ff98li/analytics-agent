@@ -25,7 +25,7 @@ process_start_time() {
     # Stack service comm values (python, minio, redis-server, bash) contain no
     # spaces, so field 22 is stable here. Deployment-id verification below is
     # the authoritative ownership check.
-    awk '{print $22}' "/proc/$pid/stat"
+    awk '{print $22}' "/proc/$pid/stat" 2>/dev/null
 }
 
 process_pgid() {
@@ -34,7 +34,7 @@ process_pgid() {
 
 process_state() {
     [ -r "/proc/$1/stat" ] || return 1
-    awk '{print $3}' "/proc/$1/stat"
+    awk '{print $3}' "/proc/$1/stat" 2>/dev/null
 }
 
 process_identity_alive() {
