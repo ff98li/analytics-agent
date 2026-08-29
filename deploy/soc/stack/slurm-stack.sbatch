@@ -17,6 +17,14 @@
 # checkpoint, then exits cleanly so Slurm records COMPLETED (no scancel needed).
 
 set -Eeuo pipefail
+umask 077
+slurm_log_dir="${SLURM_SUBMIT_DIR:-$PWD}"
+for slurm_log in \
+    "$slurm_log_dir/08-lumilake-stack-${SLURM_JOB_ID}.out" \
+    "$slurm_log_dir/08-lumilake-stack-${SLURM_JOB_ID}.err"; do
+    [ ! -e "$slurm_log" ] || chmod 600 "$slurm_log"
+done
+unset slurm_log slurm_log_dir
 STACK_DIR="${STACK_DIR:-$HOME/lakehouse/stack}"
 # shellcheck disable=SC1090
 source "$STACK_DIR/stack-env.sh"

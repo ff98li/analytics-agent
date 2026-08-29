@@ -13,6 +13,14 @@
 # preview may therefore either succeed or reach the one expected FlowMesh
 # connection failure; parse/validation/API failures remain fatal.
 set -Eeuo pipefail
+umask 077
+slurm_log_dir="${SLURM_SUBMIT_DIR:-$PWD}"
+for slurm_log in \
+    "$slurm_log_dir/09-lumilake-dryrun-${SLURM_JOB_ID}.out" \
+    "$slurm_log_dir/09-lumilake-dryrun-${SLURM_JOB_ID}.err"; do
+    [ ! -e "$slurm_log" ] || chmod 600 "$slurm_log"
+done
+unset slurm_log slurm_log_dir
 export PATH="$HOME/.local/bin:$PATH"
 source "$HOME/lakehouse/stack/stack-env.sh"
 # Keep the CLI pointed at the same (possibly overridden) port as this server.

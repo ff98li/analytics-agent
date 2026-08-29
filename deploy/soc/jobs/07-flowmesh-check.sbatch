@@ -10,6 +10,14 @@
 # Verify the new `native` worker provider imports/validates and that the
 # server worker configuration accepts its provider-specific shape.
 set -Eeuo pipefail
+umask 077
+slurm_log_dir="${SLURM_SUBMIT_DIR:-$PWD}"
+for slurm_log in \
+    "$slurm_log_dir/07-flowmesh-check-${SLURM_JOB_ID}.out" \
+    "$slurm_log_dir/07-flowmesh-check-${SLURM_JOB_ID}.err"; do
+    [ ! -e "$slurm_log" ] || chmod 600 "$slurm_log"
+done
+unset slurm_log slurm_log_dir
 export PATH="$HOME/.local/bin:$PATH"
 cd "$HOME/src/FlowMesh"
 
