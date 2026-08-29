@@ -1,0 +1,29 @@
+# FlowMesh worker provisioning config for the single-node stack.
+# `provider: native` spawns worker processes directly (no Docker) via
+# adapters/native.py. The hardened native adapter treats its resource universe
+# as the parent Slurm CUDA_VISIBLE_DEVICES allocation and maps logical slots to
+# the original ordinal/GPU-UUID/MIG-UUID tokens.
+#
+# Two workers: Lumilake classifies workers by reported hardware
+# (_has_gpu), and CPU-required ops (data retrieval) need a worker with no
+# GPU in its profile. The native adapter sets FLOWMESH_COLLECT_GPU=0 for
+# cpu workers so NVML is skipped and the profile reports no GPU.
+default_worker_config: {}
+workers:
+  - provider: native
+    init_on_start: true
+    worker_config:
+      worker_type: cpu
+      worker_alias: native-cpu-0
+      tags: "cpu"
+      log_level: INFO
+  - provider: native
+    init_on_start: true
+    worker_config:
+      worker_type: gpu
+      worker_alias: native-gpu-0
+      # Auto-pick one allocation-relative slot. Do not put physical host GPU
+      # indices here: Slurm may expose UUID or MIG tokens instead.
+      gpu_count: 1
+      tags: "gpu"
+      log_level: INFO

@@ -1,0 +1,2545 @@
+From 676c9aca8ba98a3f5d25ba8d3355a921a2662ef6 Mon Sep 17 00:00:00 2001
+From: ff98li <li.feifei.official@gmail.com>
+Date: Sat, 29 Aug 2026 18:25:26 +0800
+Subject: [PATCH] fix: harden worker control plane
+
+Signed-off-by: ff98li <li.feifei.official@gmail.com>
+---
+ .../flowmesh_cli_stack/assets/.env.example    |  10 +-
+ .../src/flowmesh_cli_stack/env_schema.py      |  37 ++-
+ docs/API.md                                   |  16 +-
+ docs/ARCHITECTURE.md                          |   2 +-
+ docs/ENV.md                                   |  51 ++-
+ src/server/auth/security.py                   |  29 +-
+ src/server/config.py                          |   2 +-
+ src/server/env.py                             |   6 +
+ src/server/routers/health.py                  | 125 ++++++-
+ src/server/schemas/common.py                  |   7 +
+ src/server/supervisor/adapters/base.py        |  12 +
+ src/server/supervisor/adapters/docker.py      |  42 ++-
+ src/server/supervisor/adapters/native.py      | 158 ++++++---
+ src/server/supervisor/adapters/vastai.py      |  20 +-
+ src/server/supervisor/manager.py              | 129 ++++++--
+ src/server/supervisor/resource_manager.py     | 162 +++++++---
+ src/server/supervisor/schemas.py              |   3 +
+ .../supervisor/services/command_listener.py   |   9 +-
+ src/server/supervisor/services/grpc_server.py |   3 +
+ src/server/supervisor/supervisor.py           |   6 +-
+ src/worker/hw.py                              |  43 ++-
+ tests/server/test_command_listener.py         |  11 +
+ tests/server/test_config.py                   |  10 +-
+ tests/server/test_health_router.py            | 124 +++++++
+ tests/server/test_hooks_wiring.py             |  39 +++
+ tests/server/test_native_worker_provider.py   | 145 +++++++++
+ tests/server/test_worker_manager_gpu.py       | 306 +++++++++++++++++-
+ tests/worker/test_hw.py                       |  45 +++
+ 28 files changed, 1391 insertions(+), 161 deletions(-)
+ create mode 100644 tests/server/test_health_router.py
+ create mode 100644 tests/server/test_native_worker_provider.py
+
+diff --git a/cli/stack/src/flowmesh_cli_stack/assets/.env.example b/cli/stack/src/flowmesh_cli_stack/assets/.env.example
+index 2effc72..1622d6a 100644
+--- a/cli/stack/src/flowmesh_cli_stack/assets/.env.example
++++ b/cli/stack/src/flowmesh_cli_stack/assets/.env.example
+@@ -24,6 +24,8 @@ ENABLE_SUPERVISOR=true
+ SERVER_HOST=localhost
+ SERVER_HTTP_PORT=8000
+ SERVER_GRPC_PORT=50051
++# Supervisor gRPC bind address.
++SERVER_GRPC_HOST=0.0.0.0
+ SERVER_LOG_LEVEL=INFO
+ 
+ # ==== Server gRPC TLS ====
+@@ -91,7 +93,7 @@ ENABLE_SERVER_SSH_CONNECTION_AUDIT=true
+ ENABLE_SERVER_SERVE_PROXY=true
+ 
+ # ==== SSH Worker Defaults ====
+-ENABLE_SSH_BY_DEFAULT=true
++ENABLE_SSH_BY_DEFAULT=false
+ SSH_DEFAULT_IMAGE=
+ SSH_DEFAULT_USER=
+ SSH_DEFAULT_TTL_SEC=
+@@ -128,6 +130,7 @@ ENABLE_WORKER_WATCHDOG=true
+ WORKER_DEATH_CHECK_INTERVAL=30
+ WORKER_DEATH_GRACE_SEC=60
+ WORKER_REHYDRATION_GRACE_SEC=120
++FLOWMESH_READY_MIN_WORKERS=0
+ 
+ # ==== Server Heartbeat ====
+ SERVER_HEARTBEAT_INTERVAL=30
+@@ -157,11 +160,16 @@ WORKER_HB_DIR=
+ FLOWMESH_BASE_URL=http://localhost:8000
+ # Supplier API key for worker authentication with the server
+ FLOWMESH_API_KEY=
++# Require FLOWMESH_API_KEY when no identity plugin is installed.
++FLOWMESH_REQUIRE_API_KEY=false
++# Allow dynamic workers to override privileged provider fields.
++FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES=false
+ NEBULA_API_BASE_URL=
+ # Server-side CUDA image used to probe local GPUs.
+ SERVER_CUDA_PROBE_IMAGE=nvidia/cuda:12.9.1-base-ubuntu24.04
+ # Optional Docker runtime name for GPU containers.
+ DOCKER_GPU_RUNTIME=nvidia
++# Allocated GPU indices, GPU UUIDs, or MIG UUIDs; use all when unrestricted.
+ CUDA_VISIBLE_DEVICES=all
+ WORKER_UPLOAD_RESULTS=false
+ WORKER_EXECUTOR_IDLE_CLEANUP_SEC=60
+diff --git a/cli/stack/src/flowmesh_cli_stack/env_schema.py b/cli/stack/src/flowmesh_cli_stack/env_schema.py
+index 361b2af..1f85649 100644
+--- a/cli/stack/src/flowmesh_cli_stack/env_schema.py
++++ b/cli/stack/src/flowmesh_cli_stack/env_schema.py
+@@ -71,6 +71,11 @@ STACK_ENV_SCHEMA = EnvSchema(
+                     required=True,
+                     min_value=1,
+                 ),
++                EnvVar(
++                    "SERVER_GRPC_HOST",
++                    "0.0.0.0",
++                    description="Supervisor gRPC bind address.",
++                ),
+                 EnvVar(
+                     "SERVER_LOG_LEVEL",
+                     "INFO",
+@@ -307,7 +312,7 @@ STACK_ENV_SCHEMA = EnvSchema(
+         EnvSection(
+             title="SSH Worker Defaults",
+             vars=[
+-                EnvVar("ENABLE_SSH_BY_DEFAULT", "true", var_type=EnvVarType.BOOL),
++                EnvVar("ENABLE_SSH_BY_DEFAULT", "false", var_type=EnvVarType.BOOL),
+                 EnvVar("SSH_DEFAULT_IMAGE"),
+                 EnvVar("SSH_DEFAULT_USER"),
+                 EnvVar("SSH_DEFAULT_TTL_SEC", var_type=EnvVarType.FLOAT, min_value=0),
+@@ -427,6 +432,12 @@ STACK_ENV_SCHEMA = EnvSchema(
+                     var_type=EnvVarType.INT,
+                     min_value=0,
+                 ),
++                EnvVar(
++                    "FLOWMESH_READY_MIN_WORKERS",
++                    "0",
++                    var_type=EnvVarType.INT,
++                    min_value=0,
++                ),
+             ],
+         ),
+         EnvSection(
+@@ -505,6 +516,22 @@ STACK_ENV_SCHEMA = EnvSchema(
+                     description="Supplier API key for worker authentication with "
+                     "the server",
+                 ),
++                EnvVar(
++                    "FLOWMESH_REQUIRE_API_KEY",
++                    "false",
++                    var_type=EnvVarType.BOOL,
++                    description=(
++                        "Require FLOWMESH_API_KEY when no identity plugin is installed."
++                    ),
++                ),
++                EnvVar(
++                    "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES",
++                    "false",
++                    var_type=EnvVarType.BOOL,
++                    description=(
++                        "Allow dynamic workers to override privileged provider fields."
++                    ),
++                ),
+                 EnvVar(
+                     "NEBULA_API_BASE_URL",
+                     var_type=EnvVarType.URL,
+@@ -521,7 +548,13 @@ STACK_ENV_SCHEMA = EnvSchema(
+                     description="Optional Docker runtime name for GPU containers.",
+                 ),
+                 EnvVar(
+-                    "CUDA_VISIBLE_DEVICES", "all", var_type=EnvVarType.CSV_INTS_OR_ALL
++                    "CUDA_VISIBLE_DEVICES",
++                    "all",
++                    var_type=EnvVarType.CSV,
++                    description=(
++                        "Allocated GPU indices, GPU UUIDs, or MIG UUIDs; use all "
++                        "when unrestricted."
++                    ),
+                 ),
+                 EnvVar("WORKER_UPLOAD_RESULTS", "false", var_type=EnvVarType.BOOL),
+                 EnvVar(
+diff --git a/docs/API.md b/docs/API.md
+index 1d961e6..bfc8f3e 100644
+--- a/docs/API.md
++++ b/docs/API.md
+@@ -13,7 +13,10 @@ Every endpoint under `/api/v1/*` (REST and WebSocket) authenticates via
+ the `Authorization: Bearer <token>` header. The token is routed through
+ the registered `IdentityProvider` chain (see `docs/PLUGINS.md`); with
+ no providers registered, every caller resolves to a default admin
+-principal. After authentication, every resource-scoped endpoint runs
++principal. Set `FLOWMESH_REQUIRE_API_KEY=true` to require a constant-time
++match against a non-empty `FLOWMESH_API_KEY` when no identity provider is
++installed. Missing or incorrect bearer tokens then return 401. After
++authentication, every resource-scoped endpoint runs
+ the registered `PermissionChecker` chain; with no checkers registered,
+ all calls succeed (open by default). The classification of resource type
+ and action per endpoint lives in `src/server/routers/v1/`. Workers
+@@ -98,10 +101,19 @@ Gated by `ENABLE_SERVER_SERVE_PROXY`.
+ 
+ | Method | Path | Description |
+ |--------|------|-------------|
+-| GET | `/healthz` | Top-level health check. |
++| GET | `/livez` | HTTP-process liveness; does not probe dependencies. |
++| GET | `/readyz` | Redis, registry, supervisor-control and configured minimum-worker readiness. Returns 503 when any check fails. |
++| GET | `/healthz` | Compatibility alias for `/readyz`. |
+ | GET | `/api/v1/system/version` | Server version. |
+ | GET | `/api/v1/system/metrics` | System metrics snapshot. |
+ 
++`/readyz` verifies that the supervisor child and its IPC command loop are
++responsive and that registered workers have fresh heartbeats. It does not open
++an extra gRPC channel: a fresh worker registration/heartbeat is the end-to-end
++evidence that the worker-facing gRPC server is functioning. Set
++`FLOWMESH_READY_MIN_WORKERS` to the deployment's required healthy worker count;
++the default `0` supports API-only deployments.
++
+ ## Cursor pagination
+ 
+ List endpoints (`/api/v1/workflows`, `/api/v1/tasks`, log queries)
+diff --git a/docs/ARCHITECTURE.md b/docs/ARCHITECTURE.md
+index 5b61e5d..f677471 100644
+--- a/docs/ARCHITECTURE.md
++++ b/docs/ARCHITECTURE.md
+@@ -40,7 +40,7 @@ The runtime is two top-level processes:
+    workflow / task / dispatch logic and the **Supervisor subsystem**
+    (`src/server/supervisor/`), which manages per-node worker lifecycle,
+    runs the worker-facing gRPC server (`:50051`), and drives the
+-   Docker / Vast.ai worker adapters.
++   Docker / Vast.ai / native-process worker adapters.
+ 2. **Worker** (`src/worker/`) — stateless executor. Connects to a
+    supervisor via gRPC, receives tasks, runs the matching executor,
+    reports results.
+diff --git a/docs/ENV.md b/docs/ENV.md
+index 7e68d39..995874e 100644
+--- a/docs/ENV.md
++++ b/docs/ENV.md
+@@ -20,6 +20,7 @@ listed here is in `.env.example`.
+ | `SERVER_RESULTS_DIR` | `flowmesh_results` | Host-side directory/docker volume to mount at `RESULTS_DIR` in the server container |
+ | `WORKER_RESULTS_DIR` | `flowmesh_results` | Server-side directory/docker volume to mount to worker containers |
+ | `SERVER_HTTP_PORT` | `8000` | Public HTTP port |
++| `SERVER_GRPC_HOST` | `0.0.0.0` | Supervisor gRPC bind address; use `127.0.0.1` for a single-node local-only deployment |
+ | `SERVER_GRPC_PORT` | `50051` | Supervisor gRPC port |
+ | `ORCHESTRATOR_DISPATCH_MODE` | `adaptive` | Scheduler mode |
+ | `ORCHESTRATOR_WORKER_SELECTION` | `best_fit` | `best_fit`, `first_fit`, `min_satisfying` |
+@@ -40,7 +41,10 @@ listed here is in `.env.example`.
+ | `FLOWMESH_PLUGIN_DATA_DIR` | `./plugin-data` | Writable mount at `/app/plugin-data` for plugin state. A path -> host bind-mount (auto-created); a bare name -> external Docker volume of that name. |
+ | `SERVER_CUDA_PROBE_IMAGE` | `nvidia/cuda:12.9.1-base-ubuntu24.04` | CUDA image the server runs briefly to query local GPU names/indices |
+ | `DOCKER_GPU_RUNTIME` | nvidia | Optional Docker runtime name for GPU probe/worker containers; leave empty unless the host requires a named runtime such as `nvidia` |
+-| `FLOWMESH_API_KEY` | – | Forwarded to spawned workers as their server-callback bearer |
++| `FLOWMESH_API_KEY` | – | Forwarded to spawned workers as their server-callback bearer; also the expected static bearer when static auth is required |
++| `FLOWMESH_REQUIRE_API_KEY` | `false` | Require `FLOWMESH_API_KEY` bearer authentication when no IdentityProvider plugin is installed |
++| `FLOWMESH_READY_MIN_WORKERS` | `0` | Minimum number of non-stale IDLE/BUSY workers required by `/readyz` and `/healthz` |
++| `FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES` | `false` | Allow dynamic worker requests to set host paths, image identity, Docker SSH/socket access, or container identity; keep disabled for shared deployments |
+ | `ENABLE_PERSISTENT_PORT_FORWARD` | `true` | Keep port-forward listeners bound between task sessions; disable to bind listeners only for active sessions |
+ | `ENABLE_SERVER_SSH_PROXY` | `true` | Enable the WebSocket proxy for interactive SSH tasks |
+ | `ENABLE_SERVER_SERVE_PROXY` | `true` | Enable the HTTP reverse proxy for `serve` tasks |
+@@ -62,6 +66,51 @@ not interfere with each other.
+ works with `--gpus all` but fails with `--runtime=nvidia` (for example, DGX
+ Spark), set `DOCKER_GPU_RUNTIME=` in the stack env.
+ 
++## Worker provider safety
++
++Dynamic Docker-worker requests accept only resource selection and metadata:
++`worker_type`, `gpu_count`, `cuda_devices`, `worker_alias`, `tags`,
++`network_bandwidth`, and `worker_cost_per_hour`. Host bind paths, image
++registry/version, SSH/socket access, and container names must come from the
++operator-owned worker configuration. Native requests use the same allowlist.
++Docker display aliases are kept separate from generated container identities,
++so an alias cannot select and force-remove an unrelated stopped container.
++Vast.ai requests accept bounded offer-selection fields (`disk`, `order`,
++`search_limit`, and `label`) plus non-privileged metadata, but cannot replace
++the operator's trusted-offer constraints, select an existing instance, replace
++the configured image, redirect the supervisor connection, choose host paths,
++or inject credentials. The privileged override switch above disables these
++request-layer safeguards and should only be used on a separately authenticated
++administrative control plane.
++Dynamic requests also cannot choose their gRPC worker token; the supervisor
++generates an unpredictable token after validation.
++Stack scaffolding leaves `ENABLE_SSH_BY_DEFAULT=false`; enable it only in an
++operator-owned deployment configuration that intentionally grants workers
++access to the Docker socket.
++
++Native workers always execute the current Python interpreter with
++`-m worker.main` from FlowMesh's source directory. API/config payloads cannot
++replace the command, working directory, heartbeat file, or log directory.
++Native logs are placed under the operator-configured `WORKER_HB_DIR`.
++Heartbeat and log filenames are derived from a digest rather than a
++request-supplied worker token or alias.
++Native child processes inherit only a runtime allowlist (for example PATH,
++locale, CUDA/HPC runtime, TLS certificate, temporary-directory and Slurm
++metadata variables) plus FlowMesh's explicit worker environment. Unrelated
++supervisor environment variables are not copied into workers.
++
++For native GPU workers, `cuda_devices` contains allocation-relative slots, not
++host-global GPU numbers. FlowMesh preserves the parent
++`CUDA_VISIBLE_DEVICES` tokens, including GPU UUID and MIG UUID forms, and maps
++slot `0` to the first token in that allocation. Omitting `cuda_devices` and
++setting `gpu_count` is preferred for scheduler-managed allocations.
++
++Provider stop must confirm the native process, Docker container, or Vast.ai
++instance has exited before FlowMesh releases an in-process GPU/offer
++reservation. This quarantine state is not durable across a supervisor crash or
++restart; deployments must still use Slurm/cgroup cleanup and reconcile orphaned
++remote instances after abnormal termination.
++
+ ## Worker
+ 
+ | Variable | Default | Description |
+diff --git a/src/server/auth/security.py b/src/server/auth/security.py
+index c609406..95e590f 100644
+--- a/src/server/auth/security.py
++++ b/src/server/auth/security.py
+@@ -1,10 +1,10 @@
+ """Minimal auth surface.
+ 
+-FlowMesh ships no native API-key auth. The semantic is:
++FlowMesh supports an opt-in static API-key mode. The semantic is:
+ 
+ - With no `IdentityProvider` plugins registered, `authenticate_api_key`
+-  returns a default admin principal — auth is effectively a no-op and every
+-  caller is admin.
++  returns a default admin principal unless `FLOWMESH_REQUIRE_API_KEY=true`.
++  Static mode requires an exact `FLOWMESH_API_KEY` bearer match.
+ - Once at least one provider is registered, every bearer token is routed
+   through the chain in registration order. The first provider returning a
+   non-`None` `PrincipalContext` wins; if none claim the token, 401 is raised.
+@@ -16,6 +16,7 @@ the registered `PermissionChecker` chain; with no checkers registered both
+ helpers short-circuit to "no filter, no gate".
+ """
+ 
++import hmac
+ import logging
+ from collections.abc import Iterable, Mapping
+ from typing import Any
+@@ -25,6 +26,7 @@ from flowmesh_hook import ResourceAction, ResourceKind
+ from lumid_hooks import PrincipalContext, ResourceRef
+ from starlette.requests import HTTPConnection
+ 
++from .. import env
+ from ..hooks import IDENTITY_PROVIDERS, PERMISSION_CHECKERS, RESOURCE_REGISTRARS
+ 
+ 
+@@ -44,11 +46,19 @@ async def authenticate_api_key(
+ ) -> PrincipalContext:
+     """Resolve a bearer token to a `PrincipalContext` via registered providers.
+ 
+-    With no providers registered, returns `default_principal()` — auth is off,
+-    every caller is admin.
++    With no providers registered, returns `default_principal()` unless static
++    bearer authentication is required by the deployment.
+     """
+     if not IDENTITY_PROVIDERS:
+-        return default_principal()
++        if not env.FLOWMESH_REQUIRE_API_KEY:
++            return default_principal()
++        expected = env.FLOWMESH_API_KEY
++        if expected and raw_key and hmac.compare_digest(raw_key, expected):
++            return default_principal()
++        raise HTTPException(
++            status_code=status.HTTP_401_UNAUTHORIZED,
++            detail="Invalid or missing bearer token",
++        )
+ 
+     for provider in IDENTITY_PROVIDERS:
+         resolved = await provider.resolve(raw_key, logger)
+@@ -67,7 +77,12 @@ async def resolve_system_principal(
+     """Resolve the principal that represents this server for system-driven actions
+     (boot-time worker spawn, supervisor self-registration, heartbeat reaper, etc.)."""
+     if not IDENTITY_PROVIDERS:
+-        return default_principal()
++        if env.FLOWMESH_REQUIRE_API_KEY and not env.FLOWMESH_API_KEY:
++            raise RuntimeError(
++                "FLOWMESH_API_KEY must be non-empty when "
++                "FLOWMESH_REQUIRE_API_KEY=true"
++            )
++        return await authenticate_api_key(api_key, logger)
+     try:
+         for provider in IDENTITY_PROVIDERS:
+             resolved = await provider.resolve(api_key, logger)
+diff --git a/src/server/config.py b/src/server/config.py
+index 3432338..0901aca 100644
+--- a/src/server/config.py
++++ b/src/server/config.py
+@@ -86,7 +86,7 @@ class GrpcConfig:
+     @classmethod
+     def from_env(cls) -> "GrpcConfig":
+         return cls(
+-            host="0.0.0.0",
++            host=os.getenv("SERVER_GRPC_HOST", "0.0.0.0"),
+             port=int(os.getenv("SERVER_GRPC_PORT") or "50051"),
+             tls_ca_file=(os.getenv("SERVER_GRPC_TLS_CA_FILE") or "").strip(),
+             tls_cert_file=(os.getenv("SERVER_GRPC_TLS_CERT_FILE") or "").strip(),
+diff --git a/src/server/env.py b/src/server/env.py
+index 21e1da5..2803545 100644
+--- a/src/server/env.py
++++ b/src/server/env.py
+@@ -21,6 +21,7 @@ SERVER_APP_PORT: int = int(
+     or "8000"
+ )
+ SERVER_GRPC_PORT: int = int(os.getenv("SERVER_GRPC_PORT") or "50051")
++SERVER_GRPC_HOST: str = os.getenv("SERVER_GRPC_HOST") or SERVER_BIND_HOST
+ 
+ SERVER_GRPC_TLS_CA_FILE: str = (os.getenv("SERVER_GRPC_TLS_CA_FILE") or "").strip()
+ SERVER_GRPC_TLS_CERT_FILE: str = (os.getenv("SERVER_GRPC_TLS_CERT_FILE") or "").strip()
+@@ -56,6 +57,11 @@ else:
+ 
+ FLOWMESH_BASE_URL: str = os.getenv("FLOWMESH_BASE_URL", "http://localhost:8000")
+ FLOWMESH_API_KEY: str = os.getenv("FLOWMESH_API_KEY", "")
++FLOWMESH_REQUIRE_API_KEY: bool = parse_bool_env("FLOWMESH_REQUIRE_API_KEY", False)
++FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES: bool = parse_bool_env(
++    "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES", False
++)
++FLOWMESH_READY_MIN_WORKERS: int = max(0, parse_int_env("FLOWMESH_READY_MIN_WORKERS", 0))
+ 
+ REDIS_URL: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+ REDIS_ACL_ENABLED = parse_bool_env("REDIS_ACL_ENABLED", False)
+diff --git a/src/server/routers/health.py b/src/server/routers/health.py
+index 791e442..afd9d31 100644
+--- a/src/server/routers/health.py
++++ b/src/server/routers/health.py
+@@ -1,15 +1,126 @@
+-from fastapi import APIRouter
++import asyncio
++from typing import Any
+ 
+-from ..schemas.common import OkResponse
++from fastapi import APIRouter, Request, Response, status
++
++from shared.schemas.command import CommandMessage, CommandType
++from shared.schemas.worker import WorkerStatus
++
++from .. import env
++from ..schemas.common import OkResponse, ReadinessResponse
+ 
+ router = APIRouter(tags=["Health", "Caller: anyone"])
+ 
+ 
+ @router.get(
+-    "/healthz",
+-    summary="Health check",
+-    description="Service health check.",
+-    response_description="Health status",
++    "/livez",
++    name="livez",
++    summary="Liveness check",
++    description="Reports whether the HTTP process can serve requests.",
++    response_description="Liveness status",
+ )
+-async def healthz() -> OkResponse:
++async def livez() -> OkResponse:
+     return OkResponse(ok=True)
++
++
++async def _bounded(awaitable: Any) -> bool:
++    try:
++        result = await asyncio.wait_for(awaitable, timeout=2.0)
++        return result is not False
++    except Exception:
++        return False
++
++
++async def _supervisor_readiness(
++    supervisor: Any,
++) -> tuple[bool, list[dict[str, Any]]]:
++    if supervisor is None:
++        return True, []
++    if not supervisor.is_alive():
++        return False, []
++    try:
++        response = await supervisor.exec_cmd(
++            CommandMessage(command=CommandType.GET_WORKERS), timeout=2.0
++        )
++    except Exception:
++        return False, []
++    return response.success, (response.data or {}).get("workers", [])
++
++
++async def _registered_worker_count(worker_registry: Any) -> tuple[bool, int | None]:
++    if worker_registry is None:
++        return True, None
++    try:
++        workers = await asyncio.wait_for(
++            worker_registry.list_workers_async(), timeout=2.0
++        )
++    except Exception:
++        return False, 0
++    count = sum(
++        not worker.stale and worker.status in (WorkerStatus.IDLE, WorkerStatus.BUSY)
++        for worker in workers
++    )
++    return True, count
++
++
++async def _readiness(request: Request) -> ReadinessResponse:
++    checks: dict[str, bool] = {}
++    details: dict[str, str] = {}
++
++    redis_client = request.app.state.redis_client
++    node_registry = request.app.state.node_registry
++    supervisor = request.app.state.supervisor
++    worker_registry = request.app.state.worker_registry
++    (
++        checks["redis_control"],
++        checks["redis_telemetry"],
++        checks["registry"],
++        supervisor_result,
++        worker_result,
++    ) = await asyncio.gather(
++        _bounded(redis_client.asyncio.control_client.ping()),
++        _bounded(redis_client.asyncio.telemetry_client.ping()),
++        _bounded(node_registry.list_nodes_async()),
++        _supervisor_readiness(supervisor),
++        _registered_worker_count(worker_registry),
++    )
++
++    checks["supervisor"], local_workers = supervisor_result
++    if supervisor is None:
++        details["supervisor"] = "disabled by configuration"
++
++    worker_registry_ready, registered_worker_count = worker_result
++    checks["registry"] = checks["registry"] and worker_registry_ready
++    if registered_worker_count is None:
++        healthy_worker_count = sum(
++            worker.get("status") == "RUNNING" and worker.get("heartbeat_fresh") is True
++            for worker in local_workers
++        )
++    else:
++        healthy_worker_count = registered_worker_count
++
++    minimum_workers = env.FLOWMESH_READY_MIN_WORKERS
++    checks["workers"] = healthy_worker_count >= minimum_workers
++    details["workers"] = f"healthy={healthy_worker_count}, required={minimum_workers}"
++    return ReadinessResponse(ok=all(checks.values()), checks=checks, details=details)
++
++
++@router.get(
++    "/readyz",
++    name="readyz",
++    summary="Readiness check",
++    description="Checks Redis, registries, supervisor control, and worker freshness.",
++    response_description="Readiness status",
++)
++@router.get(
++    "/healthz",
++    name="healthz",
++    summary="Readiness check (compatibility alias)",
++    description="Compatibility alias for /readyz.",
++    response_description="Readiness status",
++)
++async def readyz(request: Request, response: Response) -> ReadinessResponse:
++    readiness = await _readiness(request)
++    if not readiness.ok:
++        response.status_code = status.HTTP_503_SERVICE_UNAVAILABLE
++    return readiness
+diff --git a/src/server/schemas/common.py b/src/server/schemas/common.py
+index c939c28..b7882ae 100644
+--- a/src/server/schemas/common.py
++++ b/src/server/schemas/common.py
+@@ -5,6 +5,13 @@ class OkResponse(BaseModel):
+     ok: bool = Field(description="Whether the request succeeded.")
+ 
+ 
++class ReadinessResponse(OkResponse):
++    checks: dict[str, bool] = Field(description="Dependency readiness by component.")
++    details: dict[str, str] = Field(
++        default_factory=dict, description="Secret-free readiness context."
++    )
++
++
+ class VersionResponse(BaseModel):
+     version: str = Field(description="Server version.")
+ 
+diff --git a/src/server/supervisor/adapters/base.py b/src/server/supervisor/adapters/base.py
+index b5c8aeb..cc87c59 100644
+--- a/src/server/supervisor/adapters/base.py
++++ b/src/server/supervisor/adapters/base.py
+@@ -1,4 +1,5 @@
+ import os
++import time
+ from abc import ABC, abstractmethod
+ from dataclasses import dataclass
+ from typing import NewType
+@@ -93,6 +94,7 @@ class WorkerAdapter(ABC):
+         self.name = name
+         self.config = config
+         self.owner = owner
++        self._last_heartbeat_monotonic: float | None = None
+ 
+     @property
+     @abstractmethod
+@@ -117,6 +119,16 @@ class WorkerAdapter(ABC):
+             raise RuntimeError("Worker ID is not set")
+         self._worker_id = None
+ 
++    def mark_heartbeat(self) -> None:
++        self._last_heartbeat_monotonic = time.monotonic()
++
++    def heartbeat_is_fresh(self) -> bool:
++        last_seen = self._last_heartbeat_monotonic
++        return (
++            last_seen is not None
++            and time.monotonic() - last_seen <= env.SERVER_HEARTBEAT_TTL
++        )
++
+     @abstractmethod
+     def get_info(self) -> WorkerInfo:
+         pass
+diff --git a/src/server/supervisor/adapters/docker.py b/src/server/supervisor/adapters/docker.py
+index 1832793..93aa947 100644
+--- a/src/server/supervisor/adapters/docker.py
++++ b/src/server/supervisor/adapters/docker.py
+@@ -206,21 +206,26 @@ class DockerWorkerAdapter(WorkerAdapter):
+         name: str,
+         container_name: str,
+         cuda_devices: list[int] | None,
++        cuda_device_tokens: list[str] | None,
+         gpu_arch: GpuArch | None,
+         config: DockerWorkerConfig,
+         docker_client: DockerClient,
+         owner: PrincipalContext,
+     ) -> None:
+         if config.worker_type == WorkerType.GPU and (
+-            cuda_devices is None or len(cuda_devices) == 0
++            cuda_devices is None
++            or len(cuda_devices) == 0
++            or cuda_device_tokens is None
++            or len(cuda_device_tokens) != len(cuda_devices)
+         ):
+-            raise ValueError("Expected at least one CUDA device for GPU worker.")
++            raise ValueError("Expected a token for every CUDA device on GPU worker.")
+ 
+         super().__init__(token, name, config, owner)
+ 
+         self.config: DockerWorkerConfig
+         self.container_name = container_name
+         self.cuda_devices = cuda_devices
++        self.cuda_device_tokens = cuda_device_tokens
+         self.gpu_arch = gpu_arch
+ 
+         self._docker = docker_client
+@@ -244,6 +249,7 @@ class DockerWorkerAdapter(WorkerAdapter):
+             name=self.name,
+             provider=_PROVIDER_NAME,
+             status=self.status,
++            heartbeat_fresh=self.heartbeat_is_fresh(),
+             hardware=hardware,
+             ssh_limits=self.config.ssh.to_limits() if self.config.enable_ssh else None,
+         )
+@@ -264,8 +270,8 @@ class DockerWorkerAdapter(WorkerAdapter):
+ 
+     async def stop(self) -> bool:
+         prev_status = self.status
+-        if prev_status in (WorkerStatus.STOPPING, WorkerStatus.STOPPED):
+-            return True
++        if prev_status is WorkerStatus.STOPPING:
++            return False
+         self.set_status(WorkerStatus.STOPPING)
+         try:
+             ok = await asyncio.to_thread(self._stop)
+@@ -425,6 +431,7 @@ class DockerWorkerAdapter(WorkerAdapter):
+             container = self._docker.containers.get(self.container_name)
+         except NotFound:
+             self._is_started = False
++            self.set_status(WorkerStatus.STOPPED)
+             if is_started:
+                 logger.warning("Container %s not found.", self.container_name)
+             return True
+@@ -444,6 +451,7 @@ class DockerWorkerAdapter(WorkerAdapter):
+             container.stop(timeout=_STOP_TIMEOUT)
+             container.remove()
+             self._is_started = False
++            self.set_status(WorkerStatus.STOPPED)
+             return True
+         except Exception as exc:
+             log_fn = logger.error if is_started else logger.warning
+@@ -551,12 +559,12 @@ class DockerWorkerAdapter(WorkerAdapter):
+                 runtime = None
+             case WorkerType.GPU:
+                 assert self.cuda_devices is not None
++                assert self.cuda_device_tokens is not None
+                 assert self.gpu_arch is not None
+                 environment["CUDA_VISIBLE_DEVICES"] = ",".join(
+                     str(i) for i in range(len(self.cuda_devices))
+                 )
+-                cuda_devices_str = [str(i) for i in self.cuda_devices]
+-                gpu_ids = ",".join(cuda_devices_str)
++                gpu_ids = ",".join(self.cuda_device_tokens)
+                 environment["WORKER_HOST_GPU_ID"] = gpu_ids
+                 gpu_arch = self.gpu_arch.value
+                 environment["WORKER_HOST_GPU_ARCH"] = gpu_arch
+@@ -565,7 +573,9 @@ class DockerWorkerAdapter(WorkerAdapter):
+                     labels["flowmesh.worker.gpu_id"] = gpu_ids
+                     labels["flowmesh.worker.gpu_arch"] = gpu_arch
+                 device_requests = [
+-                    DeviceRequest(device_ids=cuda_devices_str, capabilities=[["gpu"]])
++                    DeviceRequest(
++                        device_ids=self.cuda_device_tokens, capabilities=[["gpu"]]
++                    )
+                 ]
+                 runtime = env.DOCKER_GPU_RUNTIME
+             case _:
+@@ -711,27 +721,33 @@ class DockerWorkerFactory(WorkerFactory):
+         self, token: WorkerTokenType, config: DockerWorkerConfig
+     ) -> DockerWorkerAdapter:
+         cuda_devices: list[int] | None
++        cuda_device_tokens: list[str] | None
+         gpu_arch: GpuArch | None
+         match config.worker_type:
+             case WorkerType.CPU:
+-                cuda_devices = gpu_arch = None
++                cuda_devices = cuda_device_tokens = gpu_arch = None
+             case WorkerType.GPU:
+                 cuda_devices, gpu_arch = self._rm.reserve_gpus(
+                     devices=config.cuda_devices,
+                     n=config.gpu_count if config.cuda_devices is None else None,
+                 )
++                cuda_device_tokens = self._rm.get_gpu_tokens(cuda_devices)
+ 
+         name = self._resolve_worker_name(config)
+-        container_name = (
+-            config.container_name
+-            if config.container_name
+-            else self._sanitize_container_name(name, config)
+-        )
++        if config.container_name:
++            container_name = config.container_name
++        elif config.worker_alias:
++            # A caller-controlled display alias must not become Docker object
++            # identity: _start() may remove a stopped container with this name.
++            container_name = self._get_next_worker_name(config.worker_type)
++        else:
++            container_name = self._sanitize_container_name(name, config)
+         worker = DockerWorkerAdapter(
+             token=token,
+             name=name,
+             container_name=container_name,
+             cuda_devices=cuda_devices,
++            cuda_device_tokens=cuda_device_tokens,
+             gpu_arch=gpu_arch,
+             config=config,
+             docker_client=self._docker,
+diff --git a/src/server/supervisor/adapters/native.py b/src/server/supervisor/adapters/native.py
+index 09de950..c8b40ef 100644
+--- a/src/server/supervisor/adapters/native.py
++++ b/src/server/supervisor/adapters/native.py
+@@ -1,4 +1,5 @@
+ import asyncio
++import hashlib
+ import json
+ import logging
+ import os
+@@ -11,8 +12,9 @@ from enum import StrEnum
+ from pathlib import Path
+ from typing import Any
+ 
+-from pydantic import BaseModel
++from pydantic import ConfigDict
+ 
++from ... import env
+ from ...hooks import PrincipalContext
+ from ..resource_manager import GpuArch, ResourceManager
+ from ..schemas import WorkerHardware, WorkerInfo, WorkerStatus
+@@ -28,6 +30,48 @@ _STOP_TIMEOUT = 30  # seconds
+ _PROVIDER_NAME = "native"
+ _HW_PROBE_PREFIX = "HW_PROBE_OUTPUT: "
+ _START_GRACE_SECONDS = 1.5
++_INHERITED_ENV_KEYS = frozenset(
++    {
++        "CONDA_DEFAULT_ENV",
++        "CONDA_PREFIX",
++        "CURL_CA_BUNDLE",
++        "CUDA_HOME",
++        "CUDA_PATH",
++        "CUDA_ROOT",
++        "DYLD_LIBRARY_PATH",
++        "HOME",
++        "LANG",
++        "LANGUAGE",
++        "LD_LIBRARY_PATH",
++        "LIBRARY_PATH",
++        "LOGNAME",
++        "MKL_NUM_THREADS",
++        "NVIDIA_DRIVER_CAPABILITIES",
++        "PATH",
++        "REQUESTS_CA_BUNDLE",
++        "SHELL",
++        "SSL_CERT_DIR",
++        "SSL_CERT_FILE",
++        "STACK_DEPLOYMENT_ID",
++        "TEMP",
++        "TMP",
++        "TMPDIR",
++        "TORCH_EXTENSIONS_DIR",
++        "USER",
++        "VIRTUAL_ENV",
++    }
++)
++_INHERITED_ENV_PREFIXES = (
++    "FI_",
++    "LC_",
++    "NCCL_",
++    "OMPI_",
++    "OMP_",
++    "PMI_",
++    "PMIX_",
++    "SLURM_",
++    "UCX_",
++)
+ 
+ logger = logging.getLogger("supervisor")
+ 
+@@ -38,6 +82,8 @@ class WorkerType(StrEnum):
+ 
+ 
+ class NativeWorkerConfig(WorkerConfig):
++    model_config = ConfigDict(frozen=True, extra="forbid")
++
+     worker_type: WorkerType = WorkerType.CPU
+     """Type of worker (cpu or gpu)"""
+     cuda_devices: list[int] | None = None
+@@ -45,14 +91,8 @@ class NativeWorkerConfig(WorkerConfig):
+     gpu_count: int = 1
+     """Number of GPUs to auto-pick when ``cuda_devices`` is unset
+     (only consulted for GPU workers)."""
+-    command: list[str] | None = None
+-    """Worker process command. Defaults to ``[sys.executable, -m, worker.main]``."""
+-    cwd: str | None = None
+-    """Working directory for the worker process (defaults to the
+-    supervisor's working directory)."""
+-    log_dir: str | None = None
+-    """Directory for worker stdout/stderr logs (defaults to the heartbeat
+-    file directory)."""
++    hb_file: None = None
++    """Native worker heartbeat paths are managed by the supervisor."""
+ 
+     def model_post_init(self, __context: object) -> None:
+         super().model_post_init(__context)
+@@ -69,22 +109,25 @@ class NativeWorkerAdapter(WorkerAdapter):
+         self,
+         token: WorkerTokenType,
+         name: str,
+-        command: list[str],
+         cuda_devices: list[int] | None,
++        cuda_device_tokens: list[str] | None,
+         gpu_arch: GpuArch | None,
+         config: NativeWorkerConfig,
+         owner: PrincipalContext,
+     ) -> None:
+         if config.worker_type == WorkerType.GPU and (
+-            cuda_devices is None or len(cuda_devices) == 0
++            cuda_devices is None
++            or len(cuda_devices) == 0
++            or cuda_device_tokens is None
++            or len(cuda_device_tokens) != len(cuda_devices)
+         ):
+-            raise ValueError("Expected at least one CUDA device for GPU worker.")
++            raise ValueError("Expected a token for every CUDA device on GPU worker.")
+ 
+         super().__init__(token, name, config, owner)
+ 
+         self.config: NativeWorkerConfig
+-        self.command = command
+         self.cuda_devices = cuda_devices
++        self.cuda_device_tokens = cuda_device_tokens
+         self.gpu_arch = gpu_arch
+ 
+         self._proc: subprocess.Popen[bytes] | None = None
+@@ -108,6 +151,7 @@ class NativeWorkerAdapter(WorkerAdapter):
+             name=self.name,
+             provider=_PROVIDER_NAME,
+             status=self.status,
++            heartbeat_fresh=self.heartbeat_is_fresh(),
+             hardware=hardware,
+         )
+ 
+@@ -127,8 +171,8 @@ class NativeWorkerAdapter(WorkerAdapter):
+ 
+     async def stop(self) -> bool:
+         prev_status = self.status
+-        if prev_status in (WorkerStatus.STOPPING, WorkerStatus.STOPPED):
+-            return True
++        if prev_status is WorkerStatus.STOPPING:
++            return False
+         self.set_status(WorkerStatus.STOPPING)
+         try:
+             ok = await asyncio.to_thread(self._stop)
+@@ -140,17 +184,38 @@ class NativeWorkerAdapter(WorkerAdapter):
+             raise
+ 
+     def _log_path(self) -> str:
+-        log_dir = self.config.log_dir
+-        if not log_dir:
+-            hb_file = self.config.hb_file or os.path.join(
+-                os.environ.get("WORKER_HB_DIR", "/tmp"), f"{self.token}.hb"
+-            )
+-            log_dir = os.path.dirname(hb_file) or "/tmp"
+-        os.makedirs(log_dir, exist_ok=True)
+-        return os.path.join(log_dir, f"{self.name}.log")
++        runtime_dir = self._runtime_dir()
++        log_dir = runtime_dir / "logs"
++        log_dir.mkdir(mode=0o700, exist_ok=True)
++        resolved = log_dir.resolve()
++        if not resolved.is_relative_to(runtime_dir):
++            raise RuntimeError("Native worker log directory escapes WORKER_HB_DIR")
++        resolved.chmod(0o700)
++        return (resolved / f"{self._token_digest()}.log").as_posix()
++
++    def _heartbeat_path(self) -> str:
++        return (self._runtime_dir() / f"{self._token_digest()}.hb").as_posix()
++
++    def _runtime_dir(self) -> Path:
++        configured_root = Path(env.WORKER_HB_DIR).expanduser().resolve()
++        runtime_dir = configured_root / "native"
++        runtime_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
++        resolved = runtime_dir.resolve()
++        if not resolved.is_relative_to(configured_root):
++            raise RuntimeError("Native worker runtime directory escapes WORKER_HB_DIR")
++        resolved.chmod(0o700)
++        return resolved
++
++    def _token_digest(self) -> str:
++        return hashlib.sha256(str(self.token).encode()).hexdigest()[:24]
++
++    @staticmethod
++    def _worker_cwd() -> str:
++        return Path(__file__).resolve().parents[3].as_posix()
+ 
+     def _environment(self) -> dict[str, str]:
+         environment = self._base_environment()
++        environment["WORKER_HB_FILE"] = self._heartbeat_path()
+         # FlowMesh installs no packages (setuptools packages=[]); the worker
+         # process resolves `shared`/`worker` imports via PYTHONPATH=src.
+         src_dir = str(Path(__file__).resolve().parents[3])
+@@ -160,10 +225,14 @@ class NativeWorkerAdapter(WorkerAdapter):
+         )
+         if self.config.worker_type == WorkerType.GPU:
+             assert self.cuda_devices is not None
++            assert self.cuda_device_tokens is not None
+             assert self.gpu_arch is not None
+-            gpu_ids = ",".join(str(i) for i in self.cuda_devices)
+-            environment["CUDA_VISIBLE_DEVICES"] = gpu_ids
+-            environment["WORKER_HOST_GPU_ID"] = gpu_ids
++            allocation = ",".join(self.cuda_device_tokens)
++            environment["CUDA_VISIBLE_DEVICES"] = allocation
++            environment["WORKER_HOST_GPU_ID"] = allocation
++            environment["FLOWMESH_VISIBLE_GPU_TOKENS"] = json.dumps(
++                self.cuda_device_tokens
++            )
+             environment["WORKER_HOST_GPU_ARCH"] = self.gpu_arch.value
+         else:
+             # Hide host GPUs from CPU workers so the scheduler cannot route
+@@ -173,28 +242,35 @@ class NativeWorkerAdapter(WorkerAdapter):
+             environment["FLOWMESH_COLLECT_GPU"] = "0"
+         return environment
+ 
++    def _process_environment(self) -> dict[str, str]:
++        inherited = {
++            key: value
++            for key, value in os.environ.items()
++            if key in _INHERITED_ENV_KEYS or key.startswith(_INHERITED_ENV_PREFIXES)
++        }
++        return inherited | self._environment()
++
+     def _start(self) -> bool:
+         if self._proc is not None and self._proc.poll() is None:
+             logger.warning("Worker process %s is already running.", self.name)
+             return True
+ 
+-        cmd = self.command or [sys.executable, "-m", "worker.main"]
++        cmd = [sys.executable, "-m", "worker.main"]
+         log_path = self._log_path()
+         log_file = open(log_path, "ab")
+         try:
+-            proc = subprocess.Popen(
++            # The argv and source working directory are fixed by the adapter.
++            proc = subprocess.Popen(  # nosec B603
+                 cmd,
+-                cwd=self.config.cwd,
+-                env={**os.environ, **self._environment()},
++                cwd=self._worker_cwd(),
++                env=self._process_environment(),
+                 stdout=log_file,
+                 stderr=subprocess.STDOUT,
+                 start_new_session=True,
+             )
+         except Exception as exc:
+             log_file.close()
+-            logger.error(
+-                "Failed to start native worker %s: %s", self.name, repr(exc)
+-            )
++            logger.error("Failed to start native worker %s: %s", self.name, repr(exc))
+             return False
+ 
+         self._proc = proc
+@@ -218,11 +294,13 @@ class NativeWorkerAdapter(WorkerAdapter):
+         proc = self._proc
+         if proc is None or proc.poll() is not None:
+             self._proc = None
++            self.set_status(WorkerStatus.STOPPED)
+             return True
+         try:
+             os.killpg(proc.pid, signal.SIGTERM)
+         except ProcessLookupError:
+             self._proc = None
++            self.set_status(WorkerStatus.STOPPED)
+             return True
+         except Exception as exc:
+             logger.error("Failed to signal native worker %s: %s", self.name, repr(exc))
+@@ -241,6 +319,7 @@ class NativeWorkerAdapter(WorkerAdapter):
+                 pass
+             proc.wait(timeout=10)
+         self._proc = None
++        self.set_status(WorkerStatus.STOPPED)
+         return True
+ 
+     def _probe_hardware(self) -> dict[str, Any] | None:
+@@ -250,10 +329,11 @@ class NativeWorkerAdapter(WorkerAdapter):
+             cmd.extend(["--bandwidth-bytes-per-sec", str(bandwidth)])
+         cmd.extend(["--collect-hw-prefix", _HW_PROBE_PREFIX])
+         try:
+-            result = subprocess.run(
++            # The argv and source working directory are fixed by the adapter.
++            result = subprocess.run(  # nosec B603
+                 cmd,
+-                cwd=self.config.cwd,
+-                env={**os.environ, **self._environment()},
++                cwd=self._worker_cwd(),
++                env=self._process_environment(),
+                 capture_output=True,
+                 timeout=120,
+             )
+@@ -308,15 +388,17 @@ class NativeWorkerFactory(WorkerFactory):
+         self, token: WorkerTokenType, config: NativeWorkerConfig
+     ) -> NativeWorkerAdapter:
+         cuda_devices: list[int] | None
++        cuda_device_tokens: list[str] | None
+         gpu_arch: GpuArch | None
+         match config.worker_type:
+             case WorkerType.CPU:
+-                cuda_devices = gpu_arch = None
++                cuda_devices = cuda_device_tokens = gpu_arch = None
+             case WorkerType.GPU:
+                 cuda_devices, gpu_arch = self._rm.reserve_gpus(
+                     devices=config.cuda_devices,
+                     n=config.gpu_count if config.cuda_devices is None else None,
+                 )
++                cuda_device_tokens = self._rm.get_gpu_tokens(cuda_devices)
+             case _:
+                 raise ValueError(f"Unsupported worker type: {config.worker_type}")
+ 
+@@ -324,8 +406,8 @@ class NativeWorkerFactory(WorkerFactory):
+         return NativeWorkerAdapter(
+             token=token,
+             name=name,
+-            command=list(config.command) if config.command else [],
+             cuda_devices=cuda_devices,
++            cuda_device_tokens=cuda_device_tokens,
+             gpu_arch=gpu_arch,
+             config=config,
+             owner=self.system_principal,
+diff --git a/src/server/supervisor/adapters/vastai.py b/src/server/supervisor/adapters/vastai.py
+index 7065431..5b76d48 100644
+--- a/src/server/supervisor/adapters/vastai.py
++++ b/src/server/supervisor/adapters/vastai.py
+@@ -135,6 +135,7 @@ class VastAIWorkerAdapter(WorkerAdapter):
+             name=self.name,
+             provider=_PROVIDER_NAME,
+             status=self.status,
++            heartbeat_fresh=self.heartbeat_is_fresh(),
+             hardware=hardware,
+         )
+ 
+@@ -165,8 +166,11 @@ class VastAIWorkerAdapter(WorkerAdapter):
+ 
+     async def stop(self) -> bool:
+         prev_status = self.status
+-        if prev_status in (WorkerStatus.STOPPING, WorkerStatus.STOPPED):
+-            return True
++        if prev_status is WorkerStatus.STOPPING:
++            return False
++        # A prior gRPC disconnect may have set this event without proving that
++        # the remote instance stopped. Require a fresh post-stop confirmation.
++        self._stop_event.clear()
+         self.set_status(WorkerStatus.STOPPING)
+         try:
+             ok = await asyncio.to_thread(self._stop)
+@@ -310,6 +314,7 @@ class VastAIWorkerAdapter(WorkerAdapter):
+     def _stop(self) -> bool:
+         instance_id = self._instance_id
+         if instance_id is None:
++            self.set_status(WorkerStatus.STOPPED)
+             return True
+ 
+         if self._created_instance:
+@@ -333,12 +338,19 @@ class VastAIWorkerAdapter(WorkerAdapter):
+                 self.name,
+                 err,
+             )
+-            self._release_reserved_offer()
+             return False
+-        self._stop_event.wait(self._STOP_TIMEOUT)
++        if not self._stop_event.wait(self._STOP_TIMEOUT):
++            logger.error(
++                "VastAI worker %s did not confirm shutdown within %.0fs; "
++                "retaining its offer reservation.",
++                self.name,
++                self._STOP_TIMEOUT,
++            )
++            return False
+         self._release_reserved_offer()
+         self._instance_id = None
+         self._hardware = self.config.hardware_specs
++        self.set_status(WorkerStatus.STOPPED)
+         return True
+ 
+     def _build_env_str(self) -> str:
+diff --git a/src/server/supervisor/manager.py b/src/server/supervisor/manager.py
+index 896e9b8..3931382 100644
+--- a/src/server/supervisor/manager.py
++++ b/src/server/supervisor/manager.py
+@@ -7,6 +7,7 @@ from typing import Any
+ import yaml
+ from pydantic import BaseModel, ConfigDict, Field
+ 
++from .. import env
+ from ..hooks import PrincipalContext
+ from .adapters.base import ProviderSpec, WorkerAdapter, WorkerTokenType
+ from .adapters.docker import get_provider_spec as docker_provider_spec
+@@ -16,6 +17,30 @@ from .registry import WorkerRegistry
+ from .schemas import WorkerInfo, WorkerStatus
+ 
+ _MAX_PARALLELISM: int = 16
++_DOCKER_REQUEST_FIELDS = frozenset(
++    {
++        "cuda_devices",
++        "gpu_count",
++        "network_bandwidth",
++        "tags",
++        "worker_alias",
++        "worker_cost_per_hour",
++        "worker_type",
++    }
++)
++_NATIVE_REQUEST_FIELDS = _DOCKER_REQUEST_FIELDS
++_VASTAI_REQUEST_FIELDS = frozenset(
++    {
++        "disk",
++        "label",
++        "network_bandwidth",
++        "order",
++        "search_limit",
++        "tags",
++        "worker_alias",
++        "worker_cost_per_hour",
++    }
++)
+ 
+ 
+ class WorkerInitConfig(BaseModel):
+@@ -183,11 +208,22 @@ class WorkerManager:
+             self.logger.warning("WorkerManager is not started.")
+             return
+ 
+-        await self._stop_and_destroy_workers(self._registry.all_workers())
+-        self._report_capacity_change()
+-        for spec in self._providers.values():
+-            spec.factory.cleanup()
+-        self._registry.clear()
++        destroyed = await self._stop_and_destroy_workers(self._registry.all_workers())
++        for worker in destroyed:
++            self._registry.try_pop(worker.token)
++        if destroyed:
++            self._report_capacity_change()
++        if not self._registry.all_workers():
++            for spec in self._providers.values():
++                spec.factory.cleanup()
++        else:
++            self.logger.error(
++                "Worker manager stopped with %d worker(s) still running; "
++                "their resource reservations remain quarantined only for the "
++                "remaining lifetime of this supervisor process (quarantine is "
++                "not persisted across a crash or restart).",
++                len(self._registry.all_workers()),
++            )
+         self._default_worker_config = None
+         self._is_started = False
+         self.logger.info("Worker manager stopped")
+@@ -196,6 +232,7 @@ class WorkerManager:
+         if not self.is_started:
+             raise RuntimeError("WorkerManager not started")
+ 
++        self._validate_requested_worker_config(init_config)
+         worker = self._create_worker(init_config)
+         if init_config.init_on_start:
+             started = await self._start_worker(worker)
+@@ -243,8 +280,9 @@ class WorkerManager:
+             return False
+ 
+         success = await self._stop_and_destroy_worker(worker)
+-        self._registry.try_pop_by_name(name)
+-        self._report_capacity_change()
++        if success:
++            self._registry.try_pop_by_name(name)
++            self._report_capacity_change()
+         return success
+ 
+     async def destroy_workers(self, names: set[str] | None = None) -> None:
+@@ -262,13 +300,42 @@ class WorkerManager:
+                 raise ValueError(f"Workers not found: {', '.join(missing)}")
+             workers = [self._registry.get_by_name(name) for name in names]
+ 
+-        await self._stop_and_destroy_workers(workers)
+-        if names is None:
+-            self._registry.clear()
++        destroyed = await self._stop_and_destroy_workers(workers)
++        for worker in destroyed:
++            self._registry.try_pop(worker.token)
++        if destroyed:
++            self._report_capacity_change()
++        destroyed_ids = {id(worker) for worker in destroyed}
++        failed_names = sorted(
++            worker.name for worker in workers if id(worker) not in destroyed_ids
++        )
++        if failed_names:
++            raise RuntimeError(f"Failed to stop worker(s): {', '.join(failed_names)}")
++
++    def _validate_requested_worker_config(self, init_config: WorkerInitConfig) -> None:
++        provider = init_config.provider.strip().lower()
++        if env.FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES:
++            return
++        if init_config.worker_token is not None:
++            raise ValueError(
++                "Request cannot choose a worker token; set "
++                "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES=true to allow it"
++            )
++        requested_fields = set(init_config.worker_config)
++        if provider == "docker":
++            forbidden = requested_fields - _DOCKER_REQUEST_FIELDS
++        elif provider == "native":
++            forbidden = requested_fields - _NATIVE_REQUEST_FIELDS
++        elif provider == "vastai":
++            forbidden = requested_fields - _VASTAI_REQUEST_FIELDS
+         else:
+-            for name in names:
+-                self._registry.try_pop_by_name(name)
+-        self._report_capacity_change()
++            forbidden = set()
++        if forbidden:
++            names = ", ".join(sorted(forbidden))
++            raise ValueError(
++                f"Request cannot set privileged {provider} worker field(s): {names}; "
++                "set FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES=true to allow it"
++            )
+ 
+     def _create_worker(self, init_config: WorkerInitConfig) -> WorkerAdapter:
+         if not self.is_started:
+@@ -299,8 +366,9 @@ class WorkerManager:
+ 
+         started = await worker.start()
+         if not started:
+-            await self._stop_and_destroy_worker(worker)
+-            self._registry.try_pop(worker.token)
++            destroyed = await self._stop_and_destroy_worker(worker)
++            if destroyed:
++                self._registry.try_pop(worker.token)
+             return False
+         return True
+ 
+@@ -320,24 +388,30 @@ class WorkerManager:
+         except Exception as exc:
+             self.logger.debug("Failed to report capacity change: %s", exc)
+ 
+-    async def _stop_and_destroy_workers(self, workers: list[WorkerAdapter]) -> None:
++    async def _stop_and_destroy_workers(
++        self, workers: list[WorkerAdapter]
++    ) -> list[WorkerAdapter]:
+         if not workers:
+-            return
++            return []
+ 
+         max_workers = min(len(workers), _MAX_PARALLELISM)
+         sema = asyncio.Semaphore(max_workers or 1)
+ 
+-        async def stop_and_destroy(worker: WorkerAdapter) -> None:
++        async def stop_and_destroy(worker: WorkerAdapter) -> WorkerAdapter | None:
+             async with sema:
+-                await self._stop_and_destroy_worker(worker)
++                success = await self._stop_and_destroy_worker(worker)
++                return worker if success else None
+ 
+-        await asyncio.gather(*(stop_and_destroy(worker) for worker in workers))
++        results = await asyncio.gather(
++            *(stop_and_destroy(worker) for worker in workers)
++        )
++        return [worker for worker in results if worker is not None]
+ 
+     async def _stop_and_destroy_worker(self, worker: WorkerAdapter) -> bool:
+         worker_name = worker.name
+         success = True
+ 
+-        if worker.status in (WorkerStatus.STARTING, WorkerStatus.RUNNING):
++        if worker.status is not WorkerStatus.STOPPING:
+             self.logger.info("Stopping worker %s...", worker_name)
+             try:
+                 success = await worker.stop()
+@@ -347,7 +421,18 @@ class WorkerManager:
+                 )
+                 success = False
+         else:
+-            self.logger.info("Destroying worker %s that is not running.", worker_name)
++            # STOPPING is not proof that the process/container/instance died.
++            # In particular, an outer asyncio timeout can cancel the coroutine
++            # while its blocking stop operation is still running in a thread.
++            success = False
++
++        if not success:
++            self.logger.error(
++                "Worker %s was not confirmed stopped; keeping it registered and "
++                "retaining its resource reservations.",
++                worker_name,
++            )
++            return False
+ 
+         try:
+             self._destroy_worker(worker)
+diff --git a/src/server/supervisor/resource_manager.py b/src/server/supervisor/resource_manager.py
+index 46eface..8cc30a7 100644
+--- a/src/server/supervisor/resource_manager.py
++++ b/src/server/supervisor/resource_manager.py
+@@ -1,15 +1,19 @@
+ import os
+ import re
++import shutil
+ import subprocess
+ from enum import StrEnum
+ from typing import Any
+ 
++from docker import DockerClient
+ from docker.types import DeviceRequest
+ from pydantic import BaseModel
+ 
+ from .. import env
+ from ..utils.helpers import get_docker_client
+ 
++_MIG_UUID_RE = re.compile(r"^MIG-[0-9a-fA-F]{8}(?:-[0-9a-fA-F]{4}){3}-[0-9a-fA-F]{12}$")
++
+ 
+ class GpuArch(StrEnum):
+     BLACKWELL = "blackwell"
+@@ -31,6 +35,7 @@ class GpuArch(StrEnum):
+ class MachineEnv(BaseModel):
+     cpu_count: int
+     gpu_families: dict[int, GpuArch]
++    gpu_tokens: dict[int, str]
+     available_gpus: set[int]
+ 
+     @property
+@@ -42,6 +47,7 @@ class ResourceManager:
+     _instance: "ResourceManager | None" = None
+ 
+     def __init__(self) -> None:
++        self._docker_client: DockerClient | None
+         try:
+             self._docker_client = get_docker_client()
+         except Exception:
+@@ -62,6 +68,13 @@ class ResourceManager:
+     def available_gpu_count(self) -> int:
+         return len(self._env.available_gpus)
+ 
++    def get_gpu_tokens(self, devices: list[int]) -> list[str]:
++        """Return parent-allocation tokens for allocation-relative slots."""
++        try:
++            return [self._env.gpu_tokens[device] for device in devices]
++        except KeyError as exc:
++            raise ValueError(f"Unknown GPU allocation slot: {exc.args[0]}") from exc
++
+     def reserve_gpus(
+         self, devices: list[int] | None = None, n: int | None = None
+     ) -> tuple[list[int], GpuArch]:
+@@ -117,61 +130,112 @@ class ResourceManager:
+             except Exception:
+                 pass
+ 
++        inventory = self._probe_gpu_inventory()
++        allocation_tokens = self._allocation_tokens(inventory)
+         gpu_families: dict[int, GpuArch] = {}
++        gpu_tokens: dict[int, str] = {}
+         available_gpus: set[int] = set()
+ 
+-        visible_devices: set[int] | None
+-        if env.CUDA_VISIBLE_DEVICES is None:
+-            visible_devices = None
+-        else:
+-            try:
+-                visible_devices = {
+-                    int(dev.strip()) for dev in env.CUDA_VISIBLE_DEVICES.split(",")
+-                }
+-            except Exception:
+-                visible_devices = set()
+-
+-        if visible_devices is None or len(visible_devices) > 0:
+-            # Detect GPUs using nvidia-smi if available
+-            try:
+-                if self._docker_client is not None:
+-                    optional_kwargs: dict[str, Any] = {}
+-                    if env.DOCKER_GPU_RUNTIME is not None:
+-                        optional_kwargs["runtime"] = env.DOCKER_GPU_RUNTIME
+-                    nvidia_smi_output = self._docker_client.containers.run(
+-                        image=env.SERVER_CUDA_PROBE_IMAGE,
+-                        device_requests=[
+-                            DeviceRequest(count=-1, capabilities=[["gpu"]])
+-                        ],
+-                        command="nvidia-smi --query-gpu=index,name --format=csv,noheader",
+-                        remove=True,
+-                        **optional_kwargs,
+-                    )
+-                    output_str = nvidia_smi_output.decode("utf-8").strip()
+-                else:
+-                    output_str = subprocess.run(
+-                        [
+-                            "nvidia-smi",
+-                            "--query-gpu=index,name",
+-                            "--format=csv,noheader",
+-                        ],
+-                        capture_output=True,
+-                        text=True,
+-                        timeout=30,
+-                    ).stdout.strip()
+-                for line in output_str.split("\n"):
+-                    if "," not in line:
+-                        continue
+-                    index_str, name = line.split(",", maxsplit=1)
+-                    index = int(index_str.strip())
+-                    if visible_devices is None or index in visible_devices:
+-                        available_gpus.add(index)
+-                        gpu_families[index] = GpuArch.from_name(name)
+-            except Exception:
+-                pass
++        for slot, token in enumerate(allocation_tokens):
++            gpu_tokens[slot] = token
++            gpu_families[slot] = self._arch_for_token(token, inventory)
++            available_gpus.add(slot)
+ 
+         return MachineEnv(
+             cpu_count=cpu_count,
+             gpu_families=gpu_families,
++            gpu_tokens=gpu_tokens,
+             available_gpus=available_gpus,
+         )
++
++    def _probe_gpu_inventory(self) -> list[tuple[int, str, str]]:
++        try:
++            if self._docker_client is not None:
++                optional_kwargs: dict[str, Any] = {}
++                if env.DOCKER_GPU_RUNTIME is not None:
++                    optional_kwargs["runtime"] = env.DOCKER_GPU_RUNTIME
++                raw_output = self._docker_client.containers.run(
++                    image=env.SERVER_CUDA_PROBE_IMAGE,
++                    device_requests=[DeviceRequest(count=-1, capabilities=[["gpu"]])],
++                    command=(
++                        "nvidia-smi --query-gpu=index,uuid,name "
++                        "--format=csv,noheader"
++                    ),
++                    remove=True,
++                    **optional_kwargs,
++                )
++                output = raw_output.decode("utf-8").strip()
++            else:
++                nvidia_smi = shutil.which("nvidia-smi")
++                if nvidia_smi is None:
++                    return []
++                # The executable is resolved to an absolute trusted utility path.
++                result = subprocess.run(  # nosec B603
++                    [
++                        nvidia_smi,
++                        "--query-gpu=index,uuid,name",
++                        "--format=csv,noheader",
++                    ],
++                    capture_output=True,
++                    text=True,
++                    timeout=30,
++                    check=False,
++                )
++                output = result.stdout.strip() if result.returncode == 0 else ""
++        except Exception:
++            return []
++
++        inventory: list[tuple[int, str, str]] = []
++        for line in output.splitlines():
++            fields = [field.strip() for field in line.split(",", maxsplit=2)]
++            if len(fields) != 3:
++                continue
++            try:
++                index = int(fields[0])
++            except ValueError:
++                continue
++            inventory.append((index, fields[1], fields[2]))
++        return inventory
++
++    @staticmethod
++    def _allocation_tokens(inventory: list[tuple[int, str, str]]) -> list[str]:
++        raw = env.CUDA_VISIBLE_DEVICES
++        if raw is None:
++            return [str(index) for index, _, _ in sorted(inventory)]
++        tokens = [token.strip() for token in raw.split(",") if token.strip()]
++        if not inventory or len(tokens) != len(set(tokens)):
++            return []
++        inventory_indices = {index for index, _, _ in inventory}
++        inventory_uuids = {uuid for _, uuid, _ in inventory if uuid}
++        non_mig_count = 0
++        for token in tokens:
++            if token.isdecimal():
++                if int(token) not in inventory_indices:
++                    return []
++                non_mig_count += 1
++                continue
++            if token.startswith("GPU-"):
++                if token not in inventory_uuids:
++                    return []
++                non_mig_count += 1
++                continue
++            if token.startswith("MIG-GPU-"):
++                if not any(uuid in token for uuid in inventory_uuids):
++                    return []
++                continue
++            # Recent drivers use opaque MIG UUIDs that do not contain their
++            # parent GPU UUID. A successful inventory probe plus the strict
++            # prefix is the strongest portable validation available here.
++            if _MIG_UUID_RE.fullmatch(token):
++                continue
++            return []
++        if non_mig_count > len(inventory):
++            return []
++        return tokens
++
++    @staticmethod
++    def _arch_for_token(token: str, inventory: list[tuple[int, str, str]]) -> GpuArch:
++        for index, uuid, name in inventory:
++            if token == str(index) or token == uuid or uuid in token:
++                return GpuArch.from_name(name)
++        return GpuArch.UNKNOWN
+diff --git a/src/server/supervisor/schemas.py b/src/server/supervisor/schemas.py
+index f03dbe6..63e65d1 100644
+--- a/src/server/supervisor/schemas.py
++++ b/src/server/supervisor/schemas.py
+@@ -24,6 +24,9 @@ class WorkerInfo(BaseModel):
+     node_alias: str = Field(default=env.NODE_ALIAS, description="Node alias")
+     provider: Annotated[str, Field(description="Worker provider")]
+     status: Annotated[WorkerStatus, Field(description="Current worker status")]
++    heartbeat_fresh: bool = Field(
++        default=False, description="Whether the local supervisor saw a fresh heartbeat"
++    )
+     hardware: Annotated[
+         WorkerHardware | None, Field(default=None, description="Hardware metadata")
+     ]
+diff --git a/src/server/supervisor/services/command_listener.py b/src/server/supervisor/services/command_listener.py
+index 4fd6fdd..fd1df96 100644
+--- a/src/server/supervisor/services/command_listener.py
++++ b/src/server/supervisor/services/command_listener.py
+@@ -28,10 +28,10 @@ type ResponseHandler = Callable[[CommandResponse], None]
+ _MAX_INFLIGHT_CMDS = 32
+ _STOP_DRAIN_TIMEOUT = 10.0
+ _START_WORKER_TIMEOUT = 600.0
+-_STOP_WORKER_TIMEOUT = 60.0
++_STOP_WORKER_TIMEOUT = 90.0
+ _CREATE_WORKER_TIMEOUT = 600.0
+-_DESTROY_WORKER_TIMEOUT = 60.0
+-_DESTROY_WORKERS_TIMEOUT = 120.0
++_DESTROY_WORKER_TIMEOUT = 90.0
++_DESTROY_WORKERS_TIMEOUT = 150.0
+ 
+ 
+ def _cmd_receiver_loop(
+@@ -515,7 +515,8 @@ class CommandListener:
+             success = await asyncio.wait_for(
+                 self._wm.destroy_worker(worker_name), timeout=_DESTROY_WORKER_TIMEOUT
+             )
+-            self._worker_locks.pop(worker_name, None)
++            if success:
++                self._worker_locks.pop(worker_name, None)
+             return CommandResponse.ok(cmd, data={"success": success})
+         except Exception as exc:
+             return CommandResponse.error(cmd, f"Failed to destroy worker: {exc}")
+diff --git a/src/server/supervisor/services/grpc_server.py b/src/server/supervisor/services/grpc_server.py
+index cbcd585..142e6d0 100644
+--- a/src/server/supervisor/services/grpc_server.py
++++ b/src/server/supervisor/services/grpc_server.py
+@@ -230,7 +230,10 @@ class SupervisorServicer(supervisor_pb2_grpc.SupervisorServicer):
+             match payload.get("type"):
+                 case "REGISTER":
+                     registered = True
++                    worker.mark_heartbeat()
+                     worker.set_status(WorkerStatus.RUNNING)
++                case "HEARTBEAT":
++                    worker.mark_heartbeat()
+                 case "UNREGISTER":
+                     unregistered = True
+             self._relay_service.add_event(payload)
+diff --git a/src/server/supervisor/supervisor.py b/src/server/supervisor/supervisor.py
+index 0cdbffa..2f8c19f 100644
+--- a/src/server/supervisor/supervisor.py
++++ b/src/server/supervisor/supervisor.py
+@@ -126,7 +126,7 @@ class WorkerSupervisor:
+         )
+         self._node_id_watcher.start()
+ 
+-    async def stop(self, timeout: float = 3.0) -> None:
++    async def stop(self, timeout: float = 120.0) -> None:
+         """Gracefully stop the supervisor child process."""
+         self._node_id_stop = True
+         if self._node_id_watcher is not None:
+@@ -419,9 +419,11 @@ def _run_supervisor(
+         # Publish unregister event early to allow the server to handle before being
+         # timed out
+         lifecycle.publish_unregister()
+-        await grpc_server.stop()
+         await command_listener.stop()
+         await worker_manager.stop()
++        # Keep gRPC available while workers shut down so their final status and
++        # unregister messages can confirm that a remote process really exited.
++        await grpc_server.stop()
+         relay_service.stop()
+         await relay_uplink.stop()
+         task_listener.stop()
+diff --git a/src/worker/hw.py b/src/worker/hw.py
+index 9ad815b..0ba8c38 100644
+--- a/src/worker/hw.py
++++ b/src/worker/hw.py
+@@ -4,6 +4,7 @@
+ Collects lightweight CPU/memory/GPU/network information for registration.
+ """
+ 
++import json
+ import os
+ import platform
+ import re
+@@ -28,6 +29,39 @@ _UNIFIED_GPU_NAME_PATTERN = re.compile(r"\b(?:gb10|tegra|thor)\b", re.IGNORECASE
+ _CUDA_DEV_ATTR_INTEGRATED = 18
+ 
+ 
++def _visible_gpu_tokens() -> list[str] | None:
++    raw = os.environ.get("FLOWMESH_VISIBLE_GPU_TOKENS")
++    if raw is None:
++        return None
++    try:
++        parsed = json.loads(raw)
++    except json.JSONDecodeError:
++        return []
++    if not isinstance(parsed, list) or not all(
++        isinstance(token, str) and token for token in parsed
++    ):
++        return []
++    return parsed
++
++
++def _nvml_device_handles() -> list[object]:
++    tokens = _visible_gpu_tokens()
++    if tokens is None:
++        return [
++            pynvml.nvmlDeviceGetHandleByIndex(index)
++            for index in range(pynvml.nvmlDeviceGetCount())
++        ]
++
++    handles: list[object] = []
++    for token in tokens:
++        if token.isdecimal():
++            handle = pynvml.nvmlDeviceGetHandleByIndex(int(token))
++        else:
++            handle = pynvml.nvmlDeviceGetHandleByUUID(token)
++        handles.append(handle)
++    return handles
++
++
+ def _is_unified_memory_gpu(name: str) -> bool:
+     return bool(_UNIFIED_GPU_NAME_PATTERN.search(name))
+ 
+@@ -126,13 +160,14 @@ def collect_hw(*, bandwidth_bytes_per_sec: float | None = None) -> WorkerHardwar
+             driver_version = raw.decode() if isinstance(raw, bytes) else raw
+             cuda_raw = pynvml.nvmlSystemGetCudaDriverVersion()
+             cuda_version = f"{cuda_raw // 1000}.{(cuda_raw % 1000) // 10}"
+-            for idx in range(pynvml.nvmlDeviceGetCount()):
+-                handle = pynvml.nvmlDeviceGetHandleByIndex(idx)
++            for logical_index, handle in enumerate(_nvml_device_handles()):
+                 name_raw = pynvml.nvmlDeviceGetName(handle)
+                 uuid_raw = pynvml.nvmlDeviceGetUUID(handle)
+                 name = name_raw.decode() if isinstance(name_raw, bytes) else name_raw
+                 uuid = uuid_raw.decode() if isinstance(uuid_raw, bytes) else uuid_raw
+-                gpu_uses_unified_memory = _device_uses_unified_memory(idx, name)
++                gpu_uses_unified_memory = _device_uses_unified_memory(
++                    logical_index, name
++                )
+                 unified_memory = unified_memory or gpu_uses_unified_memory
+                 mem_total: int | None = None
+                 if not gpu_uses_unified_memory:
+@@ -144,7 +179,7 @@ def collect_hw(*, bandwidth_bytes_per_sec: float | None = None) -> WorkerHardwar
+                         mem_total = int(mem_total_raw)
+                 devices.append(
+                     GpuInfo(
+-                        index=idx,
++                        index=logical_index,
+                         name=name,
+                         uuid=uuid,
+                         memory_total_bytes=mem_total,
+diff --git a/tests/server/test_command_listener.py b/tests/server/test_command_listener.py
+index 6d79392..1570feb 100644
+--- a/tests/server/test_command_listener.py
++++ b/tests/server/test_command_listener.py
+@@ -265,6 +265,17 @@ class TestHandleDestroyWorkerCmd:
+         assert resp.success
+         self.cl._wm.destroy_worker.assert_called_once_with("worker-abc123")
+ 
++    def test_failed_destroy_keeps_worker_lock(self) -> None:
++        self.cl._wm.destroy_worker = AsyncMock(return_value=False)  # type: ignore[method-assign]
++        lock = asyncio.Lock()
++        self.cl._worker_locks["worker-abc123"] = lock
++
++        resp = self._handle({"worker_name": "worker-abc123"})
++
++        assert resp.success
++        assert resp.data == {"success": False}
++        assert self.cl._worker_locks["worker-abc123"] is lock
++
+ 
+ # ------------------------------------------------------------------ #
+ # Parallel dispatch — different workers run concurrently; same-worker
+diff --git a/tests/server/test_config.py b/tests/server/test_config.py
+index e2239fd..61d1162 100644
+--- a/tests/server/test_config.py
++++ b/tests/server/test_config.py
+@@ -2,7 +2,15 @@
+ 
+ import pytest
+ 
+-from server.config import PortForwardConfig
++from server.config import GrpcConfig, PortForwardConfig
++
++
++def test_grpc_config_reads_bind_host(monkeypatch: pytest.MonkeyPatch) -> None:
++    monkeypatch.setenv("SERVER_GRPC_HOST", "127.0.0.1")
++
++    config = GrpcConfig.from_env()
++
++    assert config.host == "127.0.0.1"
+ 
+ 
+ def test_port_forward_config_enables_capabilities_by_default(
+diff --git a/tests/server/test_health_router.py b/tests/server/test_health_router.py
+new file mode 100644
+index 0000000..c4b56c0
+--- /dev/null
++++ b/tests/server/test_health_router.py
+@@ -0,0 +1,124 @@
++import logging
++from types import SimpleNamespace
++from unittest.mock import AsyncMock, MagicMock
++
++import pytest
++from fastapi import FastAPI
++from httpx import ASGITransport, AsyncClient
++
++from server import env
++from server.routers.health import router
++from shared.schemas.command import CommandResponse
++from shared.schemas.worker import WorkerStatus
++
++
++def _app() -> FastAPI:
++    app = FastAPI()
++    control = MagicMock()
++    control.ping = AsyncMock(return_value=True)
++    telemetry = MagicMock()
++    telemetry.ping = AsyncMock(return_value=True)
++    app.state.redis_client = SimpleNamespace(
++        asyncio=SimpleNamespace(
++            control_client=control,
++            telemetry_client=telemetry,
++        )
++    )
++    app.state.node_registry = SimpleNamespace(
++        list_nodes_async=AsyncMock(return_value=[])
++    )
++    supervisor = MagicMock()
++    supervisor.is_alive.return_value = True
++    supervisor.exec_cmd = AsyncMock(
++        return_value=CommandResponse(command_id="cmd", success=True, data={})
++    )
++    app.state.supervisor = supervisor
++    app.state.worker_registry = SimpleNamespace(
++        list_workers_async=AsyncMock(
++            return_value=[SimpleNamespace(stale=False, status=WorkerStatus.IDLE)]
++        )
++    )
++    app.state.logger = logging.getLogger("test.health")
++    app.include_router(router)
++    return app
++
++
++@pytest.mark.anyio
++async def test_livez_does_not_probe_dependencies() -> None:
++    app = _app()
++    async with AsyncClient(
++        transport=ASGITransport(app=app), base_url="http://test"
++    ) as client:
++        response = await client.get("/livez")
++
++    assert response.status_code == 200
++    assert response.json() == {"ok": True}
++    app.state.redis_client.asyncio.control_client.ping.assert_not_awaited()
++
++
++@pytest.mark.anyio
++@pytest.mark.parametrize("path", ["/readyz", "/healthz"])
++async def test_readiness_checks_dependencies_and_workers(
++    path: str, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setattr(env, "FLOWMESH_READY_MIN_WORKERS", 1)
++    async with AsyncClient(
++        transport=ASGITransport(app=_app()), base_url="http://test"
++    ) as client:
++        response = await client.get(path)
++
++    assert response.status_code == 200
++    payload = response.json()
++    assert payload["ok"] is True
++    assert all(payload["checks"].values())
++    assert payload["details"]["workers"] == "healthy=1, required=1"
++
++
++@pytest.mark.anyio
++async def test_readiness_failure_is_503_and_does_not_expose_exception(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    app = _app()
++    app.state.redis_client.asyncio.control_client.ping.side_effect = RuntimeError(
++        "redis://admin:secret@example.invalid"
++    )
++    monkeypatch.setattr(env, "FLOWMESH_READY_MIN_WORKERS", 1)
++
++    async with AsyncClient(
++        transport=ASGITransport(app=app), base_url="http://test"
++    ) as client:
++        response = await client.get("/readyz")
++
++    assert response.status_code == 503
++    assert response.json()["ok"] is False
++    assert response.json()["checks"]["redis_control"] is False
++    assert "secret" not in response.text
++
++
++@pytest.mark.anyio
++async def test_worker_node_requires_fresh_local_heartbeat(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    app = _app()
++    app.state.worker_registry = None
++    app.state.supervisor.exec_cmd.return_value = CommandResponse(
++        command_id="cmd",
++        success=True,
++        data={
++            "workers": [
++                {
++                    "status": "RUNNING",
++                    "heartbeat_fresh": False,
++                }
++            ]
++        },
++    )
++    monkeypatch.setattr(env, "FLOWMESH_READY_MIN_WORKERS", 1)
++
++    async with AsyncClient(
++        transport=ASGITransport(app=app), base_url="http://test"
++    ) as client:
++        response = await client.get("/readyz")
++
++    assert response.status_code == 503
++    assert response.json()["checks"]["workers"] is False
+diff --git a/tests/server/test_hooks_wiring.py b/tests/server/test_hooks_wiring.py
+index bd38436..1675671 100644
+--- a/tests/server/test_hooks_wiring.py
++++ b/tests/server/test_hooks_wiring.py
+@@ -26,6 +26,7 @@ from flowmesh_hook import (
+ )
+ from lumid_hooks import PrincipalContext, ResourceRef
+ 
++from server import env
+ from server.auth.security import (
+     authenticate_api_key,
+     authenticate_connection,
+@@ -34,6 +35,7 @@ from server.auth.security import (
+     register_resource,
+     require_permission,
+     resolve_accessible_ids,
++    resolve_system_principal,
+ )
+ from server.hooks import (
+     IDENTITY_PROVIDERS,
+@@ -97,6 +99,43 @@ class TestIdentityProviderWiring:
+         assert principal.principal_type == "admin"
+         assert principal.scopes == ["*"]
+ 
++    @pytest.mark.anyio
++    async def test_required_static_key_accepts_exact_bearer(
++        self, logger: logging.Logger, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        monkeypatch.setattr(env, "FLOWMESH_REQUIRE_API_KEY", True)
++        monkeypatch.setattr(env, "FLOWMESH_API_KEY", "expected-key")
++
++        principal = await authenticate_api_key("expected-key", logger)
++
++        assert principal.principal_type == "admin"
++
++    @pytest.mark.anyio
++    @pytest.mark.parametrize("raw_key", ["", "wrong-key"])
++    async def test_required_static_key_rejects_missing_or_wrong_bearer(
++        self,
++        logger: logging.Logger,
++        monkeypatch: pytest.MonkeyPatch,
++        raw_key: str,
++    ) -> None:
++        monkeypatch.setattr(env, "FLOWMESH_REQUIRE_API_KEY", True)
++        monkeypatch.setattr(env, "FLOWMESH_API_KEY", "expected-key")
++
++        with pytest.raises(HTTPException) as exc_info:
++            await authenticate_api_key(raw_key, logger)
++
++        assert exc_info.value.status_code == status.HTTP_401_UNAUTHORIZED
++
++    @pytest.mark.anyio
++    async def test_required_static_key_fails_startup_when_key_is_empty(
++        self, logger: logging.Logger, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        monkeypatch.setattr(env, "FLOWMESH_REQUIRE_API_KEY", True)
++        monkeypatch.setattr(env, "FLOWMESH_API_KEY", "")
++
++        with pytest.raises(RuntimeError, match="FLOWMESH_API_KEY"):
++            await resolve_system_principal("", logger)
++
+     @pytest.mark.anyio
+     async def test_provider_claiming_token_short_circuits(
+         self, logger: logging.Logger
+diff --git a/tests/server/test_native_worker_provider.py b/tests/server/test_native_worker_provider.py
+new file mode 100644
+index 0000000..e318a4c
+--- /dev/null
++++ b/tests/server/test_native_worker_provider.py
+@@ -0,0 +1,145 @@
++from pathlib import Path
++from unittest.mock import MagicMock, patch
++
++import pytest
++from pydantic import ValidationError
++
++from server import env
++from server.hooks import PrincipalContext
++from server.supervisor.adapters.base import WorkerTokenType
++from server.supervisor.adapters.native import (
++    NativeWorkerAdapter,
++    NativeWorkerConfig,
++    WorkerType,
++)
++from server.supervisor.resource_manager import GpuArch
++
++
++def _owner() -> PrincipalContext:
++    return PrincipalContext(
++        principal_id="test-admin",
++        org_id="test-org",
++        external_id="test-admin",
++        principal_type="admin",
++        scopes=["*"],
++    )
++
++
++def _adapter(
++    *,
++    token: str = "worker-token",
++    name: str = "native-worker",
++    config: NativeWorkerConfig | None = None,
++    devices: list[int] | None = None,
++    device_tokens: list[str] | None = None,
++) -> NativeWorkerAdapter:
++    config = config or NativeWorkerConfig()
++    return NativeWorkerAdapter(
++        token=WorkerTokenType(token),
++        name=name,
++        cuda_devices=devices,
++        cuda_device_tokens=device_tokens,
++        gpu_arch=GpuArch.UNKNOWN if devices else None,
++        config=config,
++        owner=_owner(),
++    )
++
++
++@pytest.mark.parametrize("field", ["command", "cwd", "log_dir", "hb_file"])
++def test_native_config_rejects_process_and_path_overrides(field: str) -> None:
++    value: object = ["sh"] if field == "command" else "/untrusted"
++    with pytest.raises(ValidationError):
++        NativeWorkerConfig.model_validate({field: value})
++
++
++def test_native_log_path_cannot_escape_admin_root(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setattr(env, "WORKER_HB_DIR", tmp_path.as_posix())
++    worker = _adapter(token="../../escape", name="../../escape")
++
++    log_path = Path(worker._log_path()).resolve()
++
++    assert log_path.is_relative_to((tmp_path / "native" / "logs").resolve())
++    assert "escape" not in log_path.name
++
++    heartbeat_path = Path(worker._environment()["WORKER_HB_FILE"]).resolve()
++    assert heartbeat_path.is_relative_to((tmp_path / "native").resolve())
++    assert "escape" not in heartbeat_path.name
++
++
++def test_native_log_path_rejects_symlink_escape(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    configured_root = tmp_path / "runtime-root"
++    outside = tmp_path / "outside"
++    (configured_root / "native").mkdir(parents=True)
++    outside.mkdir()
++    (configured_root / "native" / "logs").symlink_to(outside, target_is_directory=True)
++    monkeypatch.setattr(env, "WORKER_HB_DIR", configured_root.as_posix())
++
++    with pytest.raises(RuntimeError, match="escapes"):
++        _adapter()._log_path()
++
++
++def test_native_start_uses_fixed_worker_entrypoint_and_cwd(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setattr(env, "WORKER_HB_DIR", tmp_path.as_posix())
++    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
++    monkeypatch.setenv("CUDA_HOME", "/opt/cuda")
++    monkeypatch.setenv("STACK_PGADMIN_PASSWORD", "must-not-leak")
++    worker = _adapter()
++    proc = MagicMock()
++    proc.poll.return_value = None
++    worker._probe_hardware = MagicMock(return_value=None)  # type: ignore[method-assign]
++
++    with (
++        patch(
++            "server.supervisor.adapters.native.subprocess.Popen", return_value=proc
++        ) as popen,
++        patch("server.supervisor.adapters.native.time.sleep"),
++    ):
++        assert worker._start() is True
++
++    args, kwargs = popen.call_args
++    assert args[0][-2:] == ["-m", "worker.main"]
++    assert kwargs["cwd"] == worker._worker_cwd()
++    assert kwargs["env"]["PATH"] == "/usr/local/bin:/usr/bin"
++    assert kwargs["env"]["CUDA_HOME"] == "/opt/cuda"
++    assert "STACK_PGADMIN_PASSWORD" not in kwargs["env"]
++
++
++def test_native_process_environment_does_not_inherit_unrelated_secrets(
++    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setattr(env, "WORKER_HB_DIR", tmp_path.as_posix())
++    monkeypatch.setenv("PATH", "/usr/local/bin:/usr/bin")
++    monkeypatch.setenv("CUDA_HOME", "/opt/cuda")
++    monkeypatch.setenv("SLURM_JOB_ID", "12345")
++    monkeypatch.setenv("STACK_PGADMIN_PASSWORD", "must-not-leak")
++    monkeypatch.setenv("MINIO_ROOT_PASSWORD", "must-not-leak")
++
++    process_env = _adapter()._process_environment()
++
++    assert process_env["PATH"] == "/usr/local/bin:/usr/bin"
++    assert process_env["CUDA_HOME"] == "/opt/cuda"
++    assert process_env["SLURM_JOB_ID"] == "12345"
++    assert "STACK_PGADMIN_PASSWORD" not in process_env
++    assert "MINIO_ROOT_PASSWORD" not in process_env
++
++
++def test_native_gpu_environment_preserves_parent_allocation_tokens() -> None:
++    worker = _adapter(
++        config=NativeWorkerConfig(worker_type=WorkerType.GPU),
++        devices=[0, 1],
++        device_tokens=["GPU-first", "MIG-GPU-parent/1/0"],
++    )
++
++    environment = worker._environment()
++
++    assert environment["CUDA_VISIBLE_DEVICES"] == "GPU-first,MIG-GPU-parent/1/0"
++    assert environment["WORKER_HOST_GPU_ID"] == "GPU-first,MIG-GPU-parent/1/0"
++    assert environment["FLOWMESH_VISIBLE_GPU_TOKENS"] == (
++        '["GPU-first", "MIG-GPU-parent/1/0"]'
++    )
+diff --git a/tests/server/test_worker_manager_gpu.py b/tests/server/test_worker_manager_gpu.py
+index 0b3d1e1..411263f 100644
+--- a/tests/server/test_worker_manager_gpu.py
++++ b/tests/server/test_worker_manager_gpu.py
+@@ -2,19 +2,23 @@
+ 
+ import asyncio
+ import logging
++from collections import Counter
+ from unittest.mock import AsyncMock, MagicMock
+ 
+ import pytest
+ 
+ from server import env
+ from server.hooks import PrincipalContext
++from server.supervisor.adapters.base import WorkerTokenType
+ from server.supervisor.adapters.docker import (
+     DockerWorkerAdapter,
+     DockerWorkerConfig,
++    DockerWorkerFactory,
+     WorkerType,
+ )
+ from server.supervisor.manager import WorkerInitConfig, WorkerManager
+ from server.supervisor.resource_manager import GpuArch, MachineEnv, ResourceManager
++from server.supervisor.schemas import WorkerStatus
+ 
+ # ------------------------------------------------------------------ #
+ # Helpers
+@@ -27,6 +31,7 @@ def _resource_manager(available: set[int]) -> ResourceManager:
+     rm._env = MachineEnv(
+         cpu_count=16,
+         gpu_families={i: GpuArch.UNKNOWN for i in available},
++        gpu_tokens={i: str(i) for i in available},
+         available_gpus=set(available),
+     )
+     return rm
+@@ -147,6 +152,7 @@ class TestReserveGpusAtomicity:
+         rm._env = MachineEnv(
+             cpu_count=16,
+             gpu_families={0: GpuArch.HOPPER, 1: GpuArch.BLACKWELL},
++            gpu_tokens={0: "GPU-hopper", 1: "MIG-blackwell"},
+             available_gpus={0, 1},
+         )
+         with pytest.raises(ValueError, match="different architectures"):
+@@ -166,13 +172,72 @@ class TestAvailableGpuCount:
+         assert _resource_manager(set()).available_gpu_count() == 0
+ 
+ 
++class TestAllocationTokens:
++    def test_tokens_are_opaque_and_allocation_relative(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        monkeypatch.setattr(
++            env,
++            "CUDA_VISIBLE_DEVICES",
++            "GPU-first,MIG-GPU-parent/2/0",
++        )
++
++        tokens = ResourceManager._allocation_tokens(
++            [(3, "GPU-first", "NVIDIA H100"), (7, "GPU-parent", "NVIDIA H100")]
++        )
++
++        assert tokens == ["GPU-first", "MIG-GPU-parent/2/0"]
++
++    @pytest.mark.parametrize("raw", ["-1", "999", "not-a-gpu", "GPU-unknown"])
++    def test_invalid_allocation_token_fails_closed(
++        self, raw: str, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        monkeypatch.setattr(env, "CUDA_VISIBLE_DEVICES", raw)
++
++        assert (
++            ResourceManager._allocation_tokens([(0, "GPU-known", "NVIDIA H100")]) == []
++        )
++
++    def test_explicit_allocation_fails_closed_when_probe_fails(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        monkeypatch.setattr(env, "CUDA_VISIBLE_DEVICES", "0")
++
++        assert ResourceManager._allocation_tokens([]) == []
++
++    def test_reserved_slots_map_back_to_parent_tokens(self) -> None:
++        rm = object.__new__(ResourceManager)
++        rm._env = MachineEnv(
++            cpu_count=16,
++            gpu_families={0: GpuArch.HOPPER, 1: GpuArch.BLACKWELL},
++            gpu_tokens={0: "GPU-first", 1: "MIG-GPU-parent/2/0"},
++            available_gpus={0, 1},
++        )
++
++        devices, _ = rm.reserve_gpus(devices=[1])
++
++        assert devices == [1]
++        assert rm.get_gpu_tokens(devices) == ["MIG-GPU-parent/2/0"]
++
++    def test_architecture_lookup_accepts_uuid_and_mig_parent_uuid(self) -> None:
++        inventory = [(3, "GPU-parent", "NVIDIA H100")]
++
++        assert (
++            ResourceManager._arch_for_token("GPU-parent", inventory) is GpuArch.HOPPER
++        )
++        assert (
++            ResourceManager._arch_for_token("MIG-GPU-parent/2/0", inventory)
++            is GpuArch.HOPPER
++        )
++
++
+ class TestMachineEnvDetection:
+     def test_gpu_probe_uses_configured_cuda_image(
+         self, monkeypatch: pytest.MonkeyPatch
+     ) -> None:
+         rm = object.__new__(ResourceManager)
+         containers = MagicMock()
+-        containers.run.return_value = b"0, NVIDIA H100\n"
++        containers.run.return_value = b"0, GPU-h100, NVIDIA H100\n"
+         rm._docker_client = MagicMock()
+         rm._docker_client.info.return_value = {"NCPU": 32}
+         rm._docker_client.containers = containers
+@@ -185,6 +250,7 @@ class TestMachineEnvDetection:
+         assert detected.cpu_count == 32
+         assert detected.available_gpus == {0}
+         assert detected.gpu_families == {0: GpuArch.HOPPER}
++        assert detected.gpu_tokens == {0: "0"}
+         containers.run.assert_called_once()
+         assert containers.run.call_args.kwargs["image"] == "example/probe:arm64"
+         assert "runtime" not in containers.run.call_args.kwargs
+@@ -194,7 +260,7 @@ class TestMachineEnvDetection:
+     ) -> None:
+         rm = object.__new__(ResourceManager)
+         containers = MagicMock()
+-        containers.run.return_value = b"0, NVIDIA H100\n"
++        containers.run.return_value = b"0, GPU-h100, NVIDIA H100\n"
+         rm._docker_client = MagicMock()
+         rm._docker_client.info.return_value = {"NCPU": 32}
+         rm._docker_client.containers = containers
+@@ -223,6 +289,7 @@ class TestDockerWorkerRuntimeSelection:
+         )
+         worker.container_name = "worker-gpu-3"
+         worker.cuda_devices = [3]
++        worker.cuda_device_tokens = ["3"]
+         worker.gpu_arch = GpuArch.BLACKWELL
+         return worker
+ 
+@@ -246,6 +313,19 @@ class TestDockerWorkerRuntimeSelection:
+         assert environment["WORKER_HOST_GPU_ARCH"] == GpuArch.BLACKWELL.value
+         assert labels["flowmesh.worker.gpu_id"] == "3"
+ 
++    def test_gpu_worker_uses_parent_allocation_token(self) -> None:
++        worker = self._worker()
++        worker.cuda_devices = [0]
++        worker.cuda_device_tokens = ["MIG-GPU-parent/1/0"]
++
++        environment: dict[str, str] = {}
++        device_requests, _ = worker._apply_worker_type_settings(environment, {})
++
++        assert device_requests is not None
++        assert device_requests[0].device_ids == ["MIG-GPU-parent/1/0"]
++        assert environment["CUDA_VISIBLE_DEVICES"] == "0"
++        assert environment["WORKER_HOST_GPU_ID"] == "MIG-GPU-parent/1/0"
++
+     def test_gpu_worker_uses_runtime_override_when_configured(
+         self, monkeypatch: pytest.MonkeyPatch
+     ) -> None:
+@@ -268,6 +348,29 @@ class TestDockerWorkerRuntimeSelection:
+         assert environment["DOCKER_GPU_RUNTIME"] == "nvidia"
+ 
+ 
++def test_docker_worker_alias_does_not_control_container_identity() -> None:
++    factory = object.__new__(DockerWorkerFactory)
++    factory.system_principal = PrincipalContext(
++        principal_id="test-user",
++        org_id="test-org",
++        external_id="test-user",
++        principal_type="user",
++        scopes=[],
++    )
++    factory._rm = MagicMock()
++    factory._docker = MagicMock()
++    factory._docker.containers.list.return_value = []
++    factory._worker_id_registry = Counter()
++
++    worker = factory.create_worker(
++        WorkerTokenType("worker-token"),
++        DockerWorkerConfig(worker_alias="unrelated-stopped-container"),
++    )
++
++    assert worker.name == "unrelated-stopped-container"
++    assert worker.container_name == "flowmesh_server_worker_cpu_0"
++
++
+ class TestCapacityChangeReporting:
+     def _run(self, coro: object) -> object:  # type: ignore[return]
+         return asyncio.run(coro)  # type: ignore[arg-type]
+@@ -310,3 +413,202 @@ class TestCapacityChangeReporting:
+ 
+         assert result is True
+         callback.assert_called_once_with()
++
++    def test_failed_destroy_keeps_registry_and_capacity(self) -> None:
++        wm = _worker_manager()
++        callback = MagicMock()
++        wm._capacity_change_callback = callback
++        worker = MagicMock()
++        worker.name = "w-1"
++        wm._registry.try_get_by_name.return_value = worker  # type: ignore[attr-defined]
++        wm._registry.try_pop_by_name = MagicMock()  # type: ignore[attr-defined, method-assign]
++        wm._stop_and_destroy_worker = AsyncMock(return_value=False)  # type: ignore[method-assign]
++
++        result = self._run(wm.destroy_worker("w-1"))
++
++        assert result is False
++        wm._registry.try_pop_by_name.assert_not_called()
++        callback.assert_not_called()
++
++    def test_failed_stop_does_not_release_resources(self) -> None:
++        wm = _worker_manager()
++        worker = MagicMock()
++        worker.name = "w-1"
++        worker.status = WorkerStatus.RUNNING
++        worker.stop = AsyncMock(return_value=False)
++        wm._destroy_worker = MagicMock()  # type: ignore[method-assign]
++
++        result = self._run(wm._stop_and_destroy_worker(worker))
++
++        assert result is False
++        wm._destroy_worker.assert_not_called()
++
++    def test_disconnected_worker_requires_provider_stop_confirmation(self) -> None:
++        wm = _worker_manager()
++        worker = MagicMock()
++        worker.name = "w-1"
++        worker.status = WorkerStatus.STOPPED
++        worker.stop = AsyncMock(return_value=False)
++        wm._destroy_worker = MagicMock()  # type: ignore[method-assign]
++
++        result = self._run(wm._stop_and_destroy_worker(worker))
++
++        assert result is False
++        worker.stop.assert_awaited_once_with()
++        wm._destroy_worker.assert_not_called()
++
++    def test_failed_start_cleanup_keeps_unconfirmed_worker_registered(self) -> None:
++        wm = _worker_manager()
++        worker = MagicMock()
++        worker.status = WorkerStatus.STOPPED
++        worker.start = AsyncMock(return_value=False)
++        wm._stop_and_destroy_worker = AsyncMock(return_value=False)  # type: ignore[method-assign]
++        wm._registry.try_pop = MagicMock()  # type: ignore[attr-defined, method-assign]
++
++        result = self._run(wm._start_worker(worker))
++
++        assert result is False
++        wm._registry.try_pop.assert_not_called()
++
++
++class TestRequestedProviderConfigPolicy:
++    def test_request_cannot_choose_worker_token(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        wm = _worker_manager()
++        monkeypatch.setattr(env, "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES", False)
++
++        with pytest.raises(ValueError, match="worker token"):
++            wm._validate_requested_worker_config(
++                WorkerInitConfig(provider="native", worker_token="known-token")
++            )
++
++    @pytest.mark.parametrize(
++        "field",
++        [
++            "container_name",
++            "docker_registry",
++            "enable_ssh",
++            "hf_cache_dir",
++            "results_dir",
++            "ssh",
++            "version",
++        ],
++    )
++    def test_docker_privileged_fields_are_rejected(
++        self, field: str, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        wm = _worker_manager()
++        monkeypatch.setattr(env, "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES", False)
++        config = WorkerInitConfig(provider="docker", worker_config={field: "value"})
++
++        with pytest.raises(ValueError, match=field):
++            wm._validate_requested_worker_config(config)
++
++    def test_docker_allows_resource_selection(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        wm = _worker_manager()
++        monkeypatch.setattr(env, "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES", False)
++        config = WorkerInitConfig(
++            provider="docker",
++            worker_config={
++                "worker_type": "gpu",
++                "gpu_count": 1,
++                "cuda_devices": [0],
++                "worker_alias": "gpu-0",
++                "tags": "soc",
++            },
++        )
++
++        wm._validate_requested_worker_config(config)
++
++    @pytest.mark.parametrize(
++        "field",
++        [
++            "flowmesh_url",
++            "hf_cache_dir",
++            "openai_api_key",
++            "results_dir",
++            "supervisor_grpc_target",
++        ],
++    )
++    def test_native_privileged_base_fields_are_rejected(
++        self, field: str, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        wm = _worker_manager()
++        monkeypatch.setattr(env, "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES", False)
++
++        with pytest.raises(ValueError, match=field):
++            wm._validate_requested_worker_config(
++                WorkerInitConfig(provider="native", worker_config={field: "value"})
++            )
++
++    @pytest.mark.parametrize(
++        "field",
++        [
++            "docker_registry",
++            "flowmesh_url",
++            "hf_cache_dir",
++            "instance_id",
++            "openai_api_key",
++            "results_dir",
++            "supervisor_grpc_target",
++            "vast_api_key",
++            "version",
++        ],
++    )
++    def test_vastai_privileged_fields_are_rejected(
++        self, field: str, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        wm = _worker_manager()
++        monkeypatch.setattr(env, "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES", False)
++
++        with pytest.raises(ValueError, match=field):
++            wm._validate_requested_worker_config(
++                WorkerInitConfig(provider="vastai", worker_config={field: "value"})
++            )
++
++    @pytest.mark.parametrize("field", ["no_default", "specs"])
++    def test_vastai_cannot_relax_offer_trust_requirements(
++        self, field: str, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        wm = _worker_manager()
++        monkeypatch.setattr(env, "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES", False)
++
++        with pytest.raises(ValueError, match=field):
++            wm._validate_requested_worker_config(
++                WorkerInitConfig(provider="vastai", worker_config={field: {}})
++            )
++
++    def test_vastai_allows_offer_selection(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        wm = _worker_manager()
++        monkeypatch.setattr(env, "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES", False)
++
++        wm._validate_requested_worker_config(
++            WorkerInitConfig(
++                provider="vastai",
++                worker_config={
++                    "disk": 40,
++                    "order": "score-",
++                    "search_limit": 5,
++                    "worker_alias": "remote-gpu",
++                },
++            )
++        )
++
++    def test_admin_override_switch_allows_privileged_fields(
++        self, monkeypatch: pytest.MonkeyPatch
++    ) -> None:
++        wm = _worker_manager()
++        monkeypatch.setattr(env, "FLOWMESH_ALLOW_PRIVILEGED_WORKER_OVERRIDES", True)
++
++        wm._validate_requested_worker_config(
++            WorkerInitConfig(
++                provider="docker",
++                worker_token="operator-token",
++                worker_config={"results_dir": "/admin/path"},
++            )
++        )
+diff --git a/tests/worker/test_hw.py b/tests/worker/test_hw.py
+index cf98a96..3a38c6f 100644
+--- a/tests/worker/test_hw.py
++++ b/tests/worker/test_hw.py
+@@ -1,7 +1,10 @@
+ """Tests for worker hardware detection."""
+ 
++import json
+ from unittest.mock import mock_open, patch
+ 
++import pytest
++
+ from worker import hw
+ 
+ 
+@@ -51,6 +54,7 @@ def test_collect_hw_marks_gb10_as_unified_memory() -> None:
+         patch.object(hw, "pynvml", _FakePynvml),
+         patch("worker.hw._cuda_device_is_integrated", return_value=True),
+         patch("worker.hw.os.path.exists", return_value=True),
++        patch("worker.hw.sys.platform", "linux"),
+         patch("builtins.open", mock_open(read_data=meminfo)),
+     ):
+         hardware = hw.collect_hw()
+@@ -78,6 +82,7 @@ def test_collect_hw_falls_back_to_name_heuristic_for_integrated_families() -> No
+         patch.object(hw, "pynvml", _FallbackNamePynvml),
+         patch("worker.hw._cuda_device_is_integrated", return_value=None),
+         patch("worker.hw.os.path.exists", return_value=True),
++        patch("worker.hw.sys.platform", "linux"),
+         patch("builtins.open", mock_open(read_data=meminfo)),
+     ):
+         hardware = hw.collect_hw()
+@@ -86,3 +91,43 @@ def test_collect_hw_falls_back_to_name_heuristic_for_integrated_families() -> No
+     assert hardware.gpu.shared_memory_total_bytes == 131072000 * 1024
+     assert hardware.gpu.devices[0].name == "NVIDIA Tegra Thor"
+     assert hardware.gpu.devices[0].memory_total_bytes is None
++
++
++class _AllocatedPynvml(_FakePynvml):
++    @staticmethod
++    def nvmlDeviceGetCount() -> int:
++        return 4
++
++    @staticmethod
++    def nvmlDeviceGetName(handle: int | str) -> bytes:
++        return b"NVIDIA H100"
++
++    @staticmethod
++    def nvmlDeviceGetUUID(handle: int | str) -> bytes:
++        return f"GPU-{handle}".encode()
++
++    @staticmethod
++    def nvmlDeviceGetHandleByUUID(uuid: str) -> str:
++        return uuid
++
++    @staticmethod
++    def nvmlDeviceGetMemoryInfo(handle: int | str) -> object:
++        return type("Memory", (), {"total": 80 * 1024**3})()
++
++
++@pytest.mark.parametrize("token", ["3", "GPU-abc", "MIG-GPU-parent/1/0"])
++def test_collect_hw_reports_only_allocated_gpu_with_logical_index(
++    token: str, monkeypatch: pytest.MonkeyPatch
++) -> None:
++    monkeypatch.setenv("FLOWMESH_VISIBLE_GPU_TOKENS", json.dumps([token]))
++    with (
++        patch.object(hw, "pynvml", _AllocatedPynvml),
++        patch("worker.hw._cuda_device_is_integrated", return_value=False),
++        patch("worker.hw.os.path.exists", return_value=False),
++    ):
++        hardware = hw.collect_hw()
++
++    assert len(hardware.gpu.devices) == 1
++    assert hardware.gpu.devices[0].index == 0
++    expected_handle: int | str = int(token) if token.isdecimal() else token
++    assert hardware.gpu.devices[0].uuid == f"GPU-{expected_handle}"
+-- 
+2.55.0
+

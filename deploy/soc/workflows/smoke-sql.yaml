@@ -1,0 +1,24 @@
+name: smoke-sql
+
+# Minimal end-to-end smoke workflow: one static SQL retrieval through
+# lumid-gateway. Exercises Lumilake -> FlowMesh -> native worker ->
+# gateway -> PostgreSQL -> MinIO archive without needing any LLM weights.
+inputs:
+  Stock: []
+
+ops:
+  - id: "Profile Fetch"
+    op: DataRetrievalOp
+    data_spec:
+      type: lumid
+      mode: sql
+      output_format: jsonl
+      template: |-
+        SELECT symbol, "companyName", sector, industry, "marketCap", beta
+        FROM lumilake_demo.instrument_profile
+        ORDER BY symbol
+        LIMIT 3
+
+outputs:
+  - name: profiles
+    ref: "Profile Fetch"

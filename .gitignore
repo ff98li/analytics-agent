@@ -13,6 +13,14 @@ __pycache__/
 # Local scratch (never commit checkpoints, logs, or generated artifacts)
 generated-workflows/
 *.log
+*.pid
+checkpoints/
+run/
+secrets/
+
+# Runtime-generated transport credentials
+*.key
+*.pem
 
 # Env files with credentials (even local dev ones)
 .env
