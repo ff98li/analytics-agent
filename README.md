@@ -29,7 +29,9 @@ tests/               pytest suite
 vendor/flowmesh/     patch adding a container-less worker provider to FlowMesh
 ```
 
-Cluster deployment scripts, sbatch jobs and the phase reports live outside this repository.
+The reproducible SoC deployment source-of-truth lives in `deploy/soc/`. Project,
+phase, and audit documents live in the parent CP5105 workspace's `docs/`
+directory and are intentionally not part of this code repository.
 
 ## `lumid_gateway`
 
