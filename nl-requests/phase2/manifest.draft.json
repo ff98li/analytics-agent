@@ -1,0 +1,7 @@
+{
+  "schema_version": "0.2",
+  "benchmark_id": "phase2-jobspec-v2",
+  "status": "draft",
+  "description": "Empty authoring scaffold only; not frozen benchmark evidence.",
+  "cases": []
+}
